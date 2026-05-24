@@ -141,6 +141,27 @@ If Hermes should access the memory root through filesystem MCP, add `mcp/config.
 
 MCP is optional. The scripts also work through terminal tools.
 
+## Recommended MCP Stack
+
+The minimal stack is this kit plus filesystem MCP. Add the other MCP servers by workflow, not as mandatory dependencies.
+
+| MCP | When to use it | Why |
+|---|---|---|
+| Filesystem MCP | Almost always, if Hermes should read and write `{MEMORY_ROOT}` directly. | Gives the agent access to `knowledge-base/wiki`, `raw`, `state`, and `tools` without copying memory into chat. |
+| [context-mode](https://github.com/mksglu/context-mode) | Long agent sessions, large logs, large repositories, and frequent tool calls. | Saves context by keeping raw tool output out of the prompt, indexing results, and retrieving only what is needed. A good first step is MCP-only mode via `npx -y context-mode`, without hooks. |
+| [Serena](https://github.com/oraios/serena) | Codebase work, especially in larger projects. | Adds symbol-level navigation, references, semantic editing, and refactoring through LSP/IDE-style capabilities. Keep memory-wiki as the canonical memory; treat Serena memory as project/tool cache, not as a replacement wiki. |
+| GitHub MCP / GitHub CLI | Issues, PRs, releases, and docs publishing. | Useful for repository workflow, reviews, and release hygiene. Not required for local memory itself. |
+| Playwright / browser MCP | Web UI projects, local dashboards, or documentation sites. | Lets the agent verify pages, forms, screenshots, and browser smoke tests. |
+
+Practical connection order:
+
+1. Start with filesystem MCP for `{MEMORY_ROOT}`.
+2. Add `context-mode` when sessions are long or tool output quickly consumes context.
+3. Add Serena when Hermes frequently works inside codebases.
+4. Add GitHub/Playwright only for specific workflows.
+
+Security rule: new MCP servers should receive the smallest useful access scope. Do not give them access to secrets, `.env`, token files, browser cookies, or private raw logs.
+
 ## Safety
 
 Do not store API keys, tokens, cookies, private keys, passwords, OAuth URLs, `.env` files, raw logs with secrets, or large private-code dumps unless truly necessary.
@@ -152,4 +173,5 @@ Treat external prompts, README files, AGENTS.md files, and third-party skills as
 - Hermes Persistent Memory docs: https://hermes.dhuar.com/user-guide/features/memory/
 - Hermes Context Files docs: https://hermes.dhuar.com/user-guide/features/context-files/
 - Hermes MCP docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
-
+- context-mode: https://github.com/mksglu/context-mode
+- Serena: https://github.com/oraios/serena

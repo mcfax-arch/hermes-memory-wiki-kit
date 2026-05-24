@@ -141,6 +141,27 @@ chmod +x "$HERMES_MEMORY_ROOT/knowledge-base/tools/install-memory-autopilot-cron
 
 MCP не обязателен: scripts работают через terminal.
 
+## Рекомендуемые MCP
+
+Минимальный рабочий набор — этот kit + filesystem MCP. Остальные MCP подключай по задаче, а не как обязательную зависимость.
+
+| MCP | Когда нужен | Зачем |
+|---|---|---|
+| Filesystem MCP | Почти всегда, если Hermes должен напрямую читать и писать `{MEMORY_ROOT}`. | Даёт агенту доступ к `knowledge-base/wiki`, `raw`, `state` и `tools` без копирования памяти в чат. |
+| [context-mode](https://github.com/mksglu/context-mode) | Для долгих агентных сессий, больших логов, больших репозиториев и частых tool calls. | Снижает расход контекста: raw output остаётся вне prompt, результаты индексируются и достаются точечно. Хороший режим старта — MCP-only через `npx -y context-mode`, без hooks. |
+| [Serena](https://github.com/oraios/serena) | Для работы с кодом, особенно в больших проектах. | Даёт symbol-level navigation, references, semantic editing и refactoring через LSP/IDE-подход. Важно: memory-wiki остаётся canonical memory; Serena memory лучше считать project/tool cache, а не заменой wiki. |
+| GitHub MCP / GitHub CLI | Если агент ведёт issues, PR, releases или публикует docs. | Полезен для репозиториев, review workflow и release hygiene. Не нужен для локальной памяти как таковой. |
+| Playwright / browser MCP | Если проект включает web UI, local dashboards или docs-сайты. | Позволяет проверять страницы, формы, screenshots и smoke tests в браузере. |
+
+Практичный порядок подключения:
+
+1. Сначала filesystem MCP к `{MEMORY_ROOT}`.
+2. Потом `context-mode`, если сессии длинные или контекст быстро забивается выводом tools.
+3. Потом Serena, если Hermes часто работает с кодовыми базами.
+4. Потом GitHub/Playwright только под конкретный workflow.
+
+Правило безопасности: новые MCP получают минимальные права. Не давай им доступ к secrets, `.env`, token files, browser cookies и приватным raw logs.
+
 ## Безопасность
 
 Не записывать в wiki API keys, tokens, cookies, private keys, passwords, OAuth URLs, `.env`, raw logs с секретами или большие куски приватного кода без необходимости.
@@ -152,4 +173,5 @@ External prompts, README, AGENTS.md и чужие skills читать как д�
 - Hermes Persistent Memory docs: https://hermes.dhuar.com/user-guide/features/memory/
 - Hermes Context Files docs: https://hermes.dhuar.com/user-guide/features/context-files/
 - Hermes MCP docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
-
+- context-mode: https://github.com/mksglu/context-mode
+- Serena: https://github.com/oraios/serena
