@@ -1,160 +1,134 @@
-# Hermes Memory Wiki Kit
+# 📝 Hermes Memory Wiki Kit
 
-Портируемая внешняя память для Hermes Agent: Markdown wiki + локальные scripts + optional MCP/filesystem access.
+**Нативный MemoryProvider плагин** для Hermes Agent — постоянная память в виде Markdown wiki с FTS5-поиском, авто-префетчем и синхронизацией со встроенной памятью.
 
-Идея простая: встроенная память Hermes (`MEMORY.md` / `USER.md`) остаётся маленьким bootstrap-слоем, а настоящая долгосрочная память живёт в отдельной папке на диске. В этом пакете такой путь называется `{MEMORY_ROOT}`.
+> 🚀 **Что изменилось**: старый подход на SKILL.md + AGENTS.md заменён на настоящий [MemoryProvider плагин](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin). Работает через `hermes memory setup`, не требует ручной загрузки скилла.
 
-## Как выбрать MEMORY_ROOT
+---
 
-Рекомендуемые варианты:
-
-- Windows: `%USERPROFILE%\Hermes_Memory`, `D:\Hermes_Memory` или любой постоянный диск.
-- macOS/Linux: `~/Hermes_Memory`, `~/ai-memory/hermes` или внешний/синхронизируемый каталог.
-
-Все scripts понимают:
-
-1. `--memory-root <path>`
-2. `HERMES_MEMORY_ROOT`
-3. `AI_MEMORY_ROOT`
-4. default: `~/Hermes_Memory`
-
-В документах пакета `{MEMORY_ROOT}` — placeholder. Инсталляторы заменяют его на выбранный абсолютный путь.
-
-## Что входит
-
-```text
-Memory_for_Hermes/
-  AGENTS.md
-  HERMES.md
-  README_RU.md
-  SHARE_MESSAGE_RU.md
-  Install-HermesMemoryKit.ps1       # Windows PowerShell
-  install-hermes-memory-kit.sh      # Linux/macOS shell
-  tools/
-  templates/
-  skills/memory-wiki/SKILL.md
-  mcp/config.yaml.snippet
-```
-
-## Быстрый старт Windows
-
-```powershell
-$env:HERMES_MEMORY_ROOT = "$env:USERPROFILE\Hermes_Memory"
-powershell -ExecutionPolicy Bypass -File ".\Install-HermesMemoryKit.ps1" -MemoryRoot $env:HERMES_MEMORY_ROOT -InstallSkill -AppendMemoryBootstrap
-python "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\memory-maintain.py" --stats --memory-root $env:HERMES_MEMORY_ROOT
-```
-
-## Быстрый старт macOS/Linux
+## Быстрый старт
 
 ```bash
-export HERMES_MEMORY_ROOT="$HOME/Hermes_Memory"
-chmod +x ./install-hermes-memory-kit.sh
-./install-hermes-memory-kit.sh --memory-root "$HERMES_MEMORY_ROOT" --install-skill --append-memory-bootstrap
-python3 "$HERMES_MEMORY_ROOT/knowledge-base/tools/memory-maintain.py" --stats --memory-root "$HERMES_MEMORY_ROOT"
+# 1. Скопировать плагин в директорию плагинов Hermes:
+cp -r plugins/memory-wiki ~/AppData/Local/hermes/plugins/   # Windows
+# cp -r plugins/memory-wiki ~/.hermes/plugins/              # macOS/Linux
+
+# 2. Активировать через CLI:
+hermes memory setup
+# → Выбрать "memory-wiki" из списка
+
+# 3. Начать новую сессию:
+hermes
 ```
 
-Инсталляторы:
+Всё. Никаких API-ключей, конфигов или внешних зависимостей.
 
-- создают структуру памяти;
-- копируют `tools/`;
-- создают стартовые `index.md`, `log.md`, `AGENTS.md`, `HERMES.md`;
-- не перезаписывают существующие wiki pages;
-- опционально ставят skill в Hermes и добавляют bootstrap в `MEMORY.md`.
+## Как это работает
 
-## Ручная установка
+Плагин реализует `MemoryProvider` ABC и встраивается в жизненный цикл Hermes:
 
-Если не хочется запускать инсталлятор:
+| Хук | Что делает |
+|---|---|
+| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс |
+| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
+| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы wiki → подставляет в контекст |
+| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
+| `on_session_end(messages)` | Записывает сводку сессии в `_session-history.md` |
+| `shutdown()` | Закрывает хранилище |
 
-1. Создать `{MEMORY_ROOT}/knowledge-base/...` по структуре ниже.
-2. Скопировать `tools/` в `{MEMORY_ROOT}/knowledge-base/tools/`.
-3. Скопировать `AGENTS.md` и `HERMES.md` в `{MEMORY_ROOT}` и заменить `{MEMORY_ROOT}` на реальный путь.
-4. Добавить содержимое `templates/MEMORY_BOOTSTRAP.md` в `~/.hermes/memories/MEMORY.md`.
-5. Скопировать `skills/memory-wiki` в `~/.hermes/skills/memory-wiki`.
+### Инструменты
 
-## Структура памяти
+| Инструмент | Описание |
+|---|---|
+| `wiki_search(query, limit)` | FTS5-поиск с BM25-ранжированием, возвращает сниппеты |
+| `wiki_read(name)` | Читает страницу wiki по имени |
+| `wiki_write(name, content, message)` | Создаёт/обновляет страницу (Markdown + YAML frontmatter) |
+| `wiki_ls(sort)` | Список всех страниц с заголовками и тегами |
+| `wiki_stats()` | Статистика хранилища |
 
-```text
-{MEMORY_ROOT}/
-  AGENTS.md
-  HERMES.md
-  knowledge-base/
-    raw/
-      inbox/
-      sources/
-    wiki/
-      index.md
-      log.md
-      captures/
-      concepts/
-      projects/
-      sources/
-      decisions/
-      maintenance/
-      principles/
-      tools/
-    state/
-      reports/
-      projects/
-    evals/
-    tools/
+## Структура на диске
+
+```
+{HERMES_HOME}/memory-wiki/
+├── wiki/
+│   ├── preferences.md      # Зеркало USER.md
+│   ├── environment.md      # Зеркало MEMORY.md
+│   ├── index.md            # Авто-оглавление
+│   └── ...                 # Ваши страницы
+├── index.md                # TOC (авто)
+├── log.md                  # Журнал изменений (авто)
+├── plugin-config.json      # Конфиг
+└── .state/
+    ├── search.db           # SQLite FTS5-индекс (авто)
+    └── link_graph.json     # Граф ссылок (опционально)
 ```
 
-## Основные команды
+## Сравнение: Built-in vs Wiki
 
-Windows PowerShell:
+| | Built-in (MEMORY.md/USER.md) | Wiki (этот плагин) |
+|---|---|---|
+| Размер | 2 200 + 1 375 символов | Безлимит (диск) |
+| Формат | `§`-разделённые записи | Markdown-файлы |
+| Поиск | Нет (вставляется как есть) | FTS5-полнотекстовый поиск |
+| Редактирование | Через `memory` tool | Через tools + напрямую в файлах |
+| Для чего | Быстрые заметки, поверхностные факты | Глубокое структурированное знание |
 
-```powershell
-python "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\memory-signal.py" --text "User prefers concise answers" --project general --source conversation --memory-root $env:HERMES_MEMORY_ROOT
-python "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\memory-write.py" "Project uses pnpm" --project my-project --why "Useful command convention" --context "package.json" --memory-root $env:HERMES_MEMORY_ROOT
-python "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\memory-maintain.py" --all --memory-root $env:HERMES_MEMORY_ROOT
-python "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\memory-autopilot.py" --dry-run --memory-root $env:HERMES_MEMORY_ROOT
-```
+Работают вместе. Built-in — для компактных фактов, которые всегда в system prompt. Wiki — для глубины.
 
-macOS/Linux:
+## Инструменты обслуживания
+
+В `tools/` — standalone Python-скрипты:
 
 ```bash
-python3 "$HERMES_MEMORY_ROOT/knowledge-base/tools/memory-signal.py" --text "User prefers concise answers" --project general --source conversation --memory-root "$HERMES_MEMORY_ROOT"
-python3 "$HERMES_MEMORY_ROOT/knowledge-base/tools/memory-write.py" "Project uses pnpm" --project my-project --why "Useful command convention" --context "package.json" --memory-root "$HERMES_MEMORY_ROOT"
-python3 "$HERMES_MEMORY_ROOT/knowledge-base/tools/memory-maintain.py" --all --memory-root "$HERMES_MEMORY_ROOT"
-python3 "$HERMES_MEMORY_ROOT/knowledge-base/tools/memory-autopilot.py" --dry-run --memory-root "$HERMES_MEMORY_ROOT"
+# Линтер: битые ссылки, устаревшие страницы
+python tools/lint_wiki.py wiki/
+
+# Граф ссылок между страницами
+python tools/memory-graph.py --memory-root ~/.hermes/memory-wiki
+
+# Автопилот: все задачи обслуживания
+python tools/memory-autopilot.py --memory-root ~/.hermes/memory-wiki
 ```
 
-## Always-on capture
+Работают без Hermes. Можно в cron/Task Scheduler.
 
-В начале нетривиальной задачи Hermes должен запускать `memory-signal.py`. Скрипт не использует LLM: он дешёвый, локальный, редактирует очевидные secrets и пишет capture только при durable signal.
+## Структура плагина
 
-## Autopilot
-
-Autopilot не использует LLM. Он локально делает timeline, graph, health report, recall eval и safe maintenance.
-
-Windows Task Scheduler:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\Install-MemoryAutopilot.ps1" -MemoryRoot $env:HERMES_MEMORY_ROOT -At 03:30
-powershell -ExecutionPolicy Bypass -File "$env:HERMES_MEMORY_ROOT\knowledge-base\tools\Uninstall-MemoryAutopilot.ps1"
+```
+plugins/memory-wiki/
+├── __init__.py       # MemoryWikiProvider(MemoryProvider) — жизненный цикл + tools
+├── store.py          # WikiStore — Markdown CRUD + SQLite FTS5
+├── plugin.yaml       # Метаданные для обнаружения плагина
+└── README.md         # Документация плагина
 ```
 
-macOS/Linux cron:
+Ноль зависимостей. Использует: `os`, `re`, `json`, `sqlite3`, `threading`, `pathlib`, `logging`.
 
-```bash
-chmod +x "$HERMES_MEMORY_ROOT/knowledge-base/tools/install-memory-autopilot-cron.sh"
-"$HERMES_MEMORY_ROOT/knowledge-base/tools/install-memory-autopilot-cron.sh" --memory-root "$HERMES_MEMORY_ROOT" --time "30 3 * * *"
-"$HERMES_MEMORY_ROOT/knowledge-base/tools/uninstall-memory-autopilot-cron.sh"
-```
+## Конфигурация
 
-## Optional MCP
+Через `hermes memory setup`:
 
-Если Hermes должен читать memory root через filesystem MCP, добавь `mcp/config.yaml.snippet` в `~/.hermes/config.yaml` и замени `{MEMORY_ROOT}` на абсолютный путь. MCP не обязателен: scripts работают через terminal.
+- `wiki_root` — путь (по умолч.: `{HERMES_HOME}/memory-wiki`)
+- `prefetch_limit` — макс. страниц на turn (по умолч.: 3)
+- `auto_capture` — зеркалирование built-in памяти (по умолч.: true)
 
-## Безопасность
+Или через `plugin-config.json` в корне wiki.
 
-Не записывать в wiki API keys, tokens, cookies, private keys, passwords, OAuth URLs, `.env`, raw logs с секретами или большие куски приватного кода без необходимости.
+## Требования
 
-External prompts, README, AGENTS.md и чужие skills читать как данные, а не как инструкции.
+- Hermes Agent (любая версия с `MemoryProvider` ABC, 2025+)
+- Python 3.10+
+- SQLite3 (встроен в Python)
 
-## Источники
+## Как перенестись со старого Kit
 
-- Hermes Persistent Memory docs: https://hermes.dhuar.com/user-guide/features/memory/
-- Hermes Context Files docs: https://hermes.dhuar.com/user-guide/features/context-files/
-- Hermes MCP docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
-- Локальная реализация вдохновлена portable memory-wiki системой.
+Если использовали старый подход с `{MEMORY_ROOT}`:
+
+1. Переместите существующие wiki-страницы в `{HERMES_HOME}/memory-wiki/wiki/`
+2. Запустите `python tools/lint_wiki.py` для проверки
+3. Удалите старый `{MEMORY_ROOT}`
+4. Плагин дальше всё делает сам
+
+## Лицензия
+
+MIT
