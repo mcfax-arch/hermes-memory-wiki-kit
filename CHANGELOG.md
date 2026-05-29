@@ -4,33 +4,31 @@
 
 ### Changed (breaking)
 
-- **Complete rewrite**: old SKILL.md + AGENTS.md + `{MEMORY_ROOT}` approach replaced by
-  proper Hermes MemoryProvider plugin (`plugins/memory-wiki/`).
-- Plugin implements `MemoryProvider` ABC with lifecycle hooks, FTS5 search, auto-prefetch,
-  and automatic sync from built-in memory tool.
-- Old `knowledge-base/tools/` directory with missing scripts removed from plugin path.
-  Maintenance scripts kept in `tools/` as optional utilities.
-- Old `AGENTS.md` replaced with simplified version pointing to plugin.
-- `HERMES.md` removed (no longer needed — plugin is self-contained).
-- Install scripts (`Install-HermesMemoryKit.ps1`, `install-hermes-memory-kit.sh`) kept
-  for legacy migration path but plugin installation is now `cp -r plugins/memory-wiki {HERMES_HOME}/plugins/`.
+- **Renamed** from `memory-wiki` → `memory_wiki` (PEP 8 compliant — Python package
+  names must not contain hyphens). Directory, config key, and provider name all updated.
+- **v2 rewrite** of `__init__.py` and `store.py` with 6 new features (see Added).
+- `on_memory_write` replace now uses proper entry-based matching from metadata.
+- Prefetch now uses recency boost + tag scoring for smarter ranking.
+- Log auto-trims at 500 entries (was unbounded).
 
-### Added
+### Added (v2)
 
-- `plugins/memory-wiki/` — MemoryProvider plugin with:
-  - `__init__.py`: MemoryWikiProvider — lifecycle, 5 tools, config schema
-  - `store.py`: WikiStore — Markdown CRUD + SQLite FTS5 search
-  - `plugin.yaml`: metadata for Hermes discovery
-  - `README.md`: plugin docs
-- Automatic prefetch: before each turn, searches wiki for relevant pages
-- Automatic mirror: built-in `memory` tool writes → `preferences.md` / `environment.md`
-- Session summary: recording in `_session-history.md`
-- `hermes memory setup` integration: config via CLI wizard
+- `plugins/memory_wiki/` — renamed package:
+  - `__init__.py`: v2 — `on_pre_compress`, `on_session_switch`, `on_delegation`
+  - `store.py`: v2 — `index_all_existing()`, `_trim_log_if_needed()`, recency scoring
+  - `plugin.yaml`: updated hooks list
+- **Auto-indexing**: existing .md files in wiki/ are indexed at startup
+- **on_pre_compress**: extracts notable patterns (remembers, corrections, code snippets)
+  before context compression, saves to `_compressed/` page
+- **on_session_switch**: handles `/resume`, `/branch`, `/new` — updates session_id,
+  flushes turn counter on reset
+- **on_delegation**: captures subagent task+result pairs to `_delegations/` page
+- **Recency boost**: pages modified today get -2.0 score bonus, this week -0.5
+- **Tag boost**: query terms boost pages with matching names
 
 ### Removed
 
 - Old `skills/memory-wiki/SKILL.md` — replaced by plugin
-- Old `mcp/config.yaml.snippet` — not needed (plugin is self-contained)
-- Old `HERMES.md` — not needed
-- Old `SHARE_MESSAGE_RU.md` — not needed
-- Old installer scripts reference to non-existent `tools/` files (`capture.py`, `status.py`, etc.)
+- Old `mcp/config.yaml.snippet` — not needed
+- Old `HERMES.md`, `SHARE_MESSAGE_RU.md` — not needed
+- Old `memory-wiki` (hyphenated) directory — renamed to `memory_wiki`

@@ -1,6 +1,0 @@
-name: memory-wiki
-version: 1.0.0
-description: "Persistent Markdown wiki memory. Local-first, no API key needed. Editable .md files with FTS5 search, auto-prefetch, and automatic sync from built-in memory tool."
-hooks:
-  - on_session_end
-  - on_memory_write

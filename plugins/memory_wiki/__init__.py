@@ -1,18 +1,19 @@
-"""Memory Wiki Plugin — persistent Markdown wiki memory for Hermes Agent.
+"""Memory Wiki Plugin v2 -- persistent Markdown wiki memory for Hermes Agent.
 
 Provides a proper MemoryProvider implementation that stores durable
 knowledge as editable Markdown files with FTS5 search.  Complements
 the built-in memory (MEMORY.md/USER.md) which stays for quick surface
-facts — wiki is for depth.
+facts -- wiki is for depth.
 
-Lifecycle integration:
-  - initialize()     — create storage, rebuild index
-  - system_prompt_block() — brief usage instructions
-  - prefetch(query)  — search wiki, inject relevant pages as context
-  - sync_turn()      — maintain turn log
-  - on_session_end() — compile session wrap-up
-  - on_memory_write() — mirror built-in memory tool writes to wiki
-  - get_tool_schemas() → tools: wiki_search, wiki_read, wiki_write, wiki_ls
+v2 improvements:
+  - Renamed to memory_wiki (underscore, not hyphen -- PEP 8 compliant)
+  - Auto-indexes existing .md files at startup
+  - on_pre_compress hook -- saves compressed messages to wiki
+  - on_session_switch -- handles /resume, /branch cleanly
+  - on_delegation -- captures subagent task+result pairs
+  - on_memory_write replace -- proper entry-based matching
+  - Prefetch with recency + tag boost scoring
+  - Log auto-trimming at 500 entries
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import json
 import logging
 import os
 import time
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,16 +30,16 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-# Re-export store for potential external use
 from .store import WikiStore
 
 
 # ---------------------------------------------------------------------------
-# Config defaults
+# Constants
 # ---------------------------------------------------------------------------
 
 DEFAULT_PREFETCH_LIMIT = 3
 DEFAULT_AUTO_CAPTURE = True
+COMPRESSED_PAGES_DIR = "_compressed"
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ WIKI_SEARCH_SCHEMA = {
     "name": "wiki_search",
     "description": (
         "Search the memory wiki for pages matching your query. "
-        "Uses full-text search (FTS5) with BM25 ranking. "
+        "Uses full-text search (FTS5) with BM25 ranking, recency boost, and tag scoring. "
         "Use this when you need to recall stored knowledge about a topic. "
         "Returns snippets of matching pages."
     ),
@@ -93,7 +95,7 @@ WIKI_WRITE_SCHEMA = {
     "description": (
         "Create or update a page in the memory wiki. "
         "Pages are Markdown files. You can include YAML frontmatter (---\\ntitle: ...\\ntags: [tag1, tag2]\\n---) "
-        "or just write markdown content — frontmatter will be auto-generated. "
+        "or just write markdown content -- frontmatter will be auto-generated. "
         "\n\nWHEN TO WRITE:\n"
         "- User shares significant personal information (career, projects, health, goals)\n"
         "- You discover a stable fact about the environment or project that will matter later\n"
@@ -130,7 +132,6 @@ WIKI_LS_SCHEMA = {
     "name": "wiki_ls",
     "description": (
         "List all pages in the memory wiki with their titles and tags. "
-        "Use this to get an overview of what knowledge is stored. "
         "Sort options: 'alpha' (by name) or 'mtime' (recently modified first)."
     ),
     "parameters": {
@@ -163,9 +164,7 @@ WIKI_STATS_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 class MemoryWikiProvider(MemoryProvider):
-    """Markdown wiki memory provider for Hermes Agent."""
-
-    # ── Core lifecycle ──────────────────────────────────────────────────
+    """Markdown wiki memory provider for Hermes Agent, v2."""
 
     def __init__(self):
         self._store: WikiStore | None = None
@@ -176,83 +175,100 @@ class MemoryWikiProvider(MemoryProvider):
         self._auto_capture: bool = DEFAULT_AUTO_CAPTURE
         self._turn_count: int = 0
         self._initialized: bool = False
+        self._platform: str = "cli"
+        self._session_ended: bool = False
+
+    # -- Core lifecycle --------------------------------------------------
 
     @property
     def name(self) -> str:
-        return "memory-wiki"
+        return "memory_wiki"
 
     def is_available(self) -> bool:
-        """Always available — no external deps needed."""
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Create storage directory and initialize the wiki store."""
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home", "")
         self._prefetch_limit = kwargs.get("prefetch_limit", DEFAULT_PREFETCH_LIMIT)
         self._auto_capture = kwargs.get("auto_capture", DEFAULT_AUTO_CAPTURE)
+        self._platform = kwargs.get("platform", "cli")
+        self._turn_count = 0
+        self._session_ended = False
 
-        # Determine wiki root: from config or default to hermes_home/memory-wiki
         if self._wiki_root:
             root = Path(self._wiki_root)
         elif self._hermes_home:
             root = Path(self._hermes_home) / "memory-wiki"
         else:
-            # Fallback: ~/.hermes/memory-wiki
             root = Path.home() / ".hermes" / "memory-wiki"
 
         try:
             self._store = WikiStore(root)
+
+            # v2: auto-index existing .md files
+            index_result = self._store.index_all_existing()
+            if index_result["indexed"] > 0:
+                logger.info(
+                    "Memory-wiki: indexed %d existing pages",
+                    index_result["indexed"],
+                )
+
             self._initialized = True
             logger.info(
-                "Memory-wiki initialized at %s (session=%s)",
+                "Memory-wiki v2 initialized at %s (session=%s)",
                 root, session_id,
             )
         except Exception as e:
             logger.warning("Failed to initialize memory-wiki store: %s", e)
             self._initialized = False
 
-    # ── System prompt block ────────────────────────────────────────────
+    # -- System prompt block ---------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """Return usage instructions for the wiki tools."""
         if not self._initialized:
             return ""
         return (
-            "═══ MEMORY WIKI ═══\n"
+            "\U0001f4da MEMORY WIKI (persistent)\n"
             "You have a persistent Markdown wiki at your disposal:\n"
-            "  wiki_search(query) — search stored knowledge\n"
-            "  wiki_read(name)    — read a wiki page\n"
-            "  wiki_write(name, content, message) — save knowledge\n"
-            "  wiki_ls(sort)      — list all pages\n"
-            "  wiki_stats()       — storage statistics\n\n"
+            "  wiki_search(query) -- search stored knowledge (FTS5 + recency boost)\n"
+            "  wiki_read(name)    -- read a wiki page\n"
+            "  wiki_write(name, content, message) -- save durable knowledge\n"
+            "  wiki_ls(sort)      -- list all pages\n"
+            "  wiki_stats()       -- storage statistics\n\n"
             "Save important facts to the wiki: user preferences, environment quirks,\n"
-            "project conventions, workflow patterns, and non-trivial solutions.\n"
-            "The wiki persists across all sessions and is searchable via FTS5.\n"
-            "Built-in memory (MEMORY.md/USER.md with the memory tool) stays for\n"
-            "compact surface-level facts; depth and detail go in the wiki.\n"
-            "═══"
+            "project conventions, workflows, and non-trivial solutions.\n"
+            "The wiki persists across all sessions, is FTS5-searchable, and auto-syncs\n"
+            "from the built-in memory tool. Built-in stays for compact surface facts;\n"
+            "depth and detail go in the wiki."
         )
 
-    # ── Prefetch (recall before each turn) ─────────────────────────────
+    # -- Prefetch (recall before each turn) ------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Search wiki for pages relevant to the current turn's query.
 
-        Returns formatted markdown pages wrapped in memory-context fence,
-        or empty string if nothing relevant found.
+        v2: Uses tag_boost from query terms for smarter ranking.
         """
         if not self._initialized or not self._store or not query.strip():
             return ""
 
         try:
-            context = self._store.search_and_format(query, limit=self._prefetch_limit)
+            # Extract potential tag terms from query for tag_boost
+            words = query.lower().split()
+            tag_terms = [w for w in words if len(w) > 3][:5]
+
+            context = self._store.search_and_format(
+                query,
+                limit=self._prefetch_limit,
+                tag_boost=tag_terms if tag_terms else None,
+            )
             return context
         except Exception as e:
             logger.debug("Memory-wiki prefetch: %s", e)
             return ""
 
-    # ── Turn sync ──────────────────────────────────────────────────────
+    # -- Turn sync -------------------------------------------------------
 
     def sync_turn(
         self,
@@ -262,41 +278,113 @@ class MemoryWikiProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Log the turn to the wiki's turn log.
-
-        Does NOT do LLM-based extraction — that's the agent's job via
-        the wiki_write tool.  But we track turn stats for session-end.
-        """
         if not self._initialized:
             return
         self._turn_count += 1
 
-    # ── Session end ────────────────────────────────────────────────────
+    # -- on_pre_compress: save insights before compression ---------------
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Called before context compression.
+
+        Extracts notable patterns from messages about to be compressed:
+        - Lines with "remember", "note", "important"
+        - User corrections
+        - Code snippets
+        - URLs and file paths
+
+        Saves a compressed snapshot to _compressed/ page.
+        Returns empty string (no injection into compression prompt).
+        """
+        if not self._initialized or not self._store or not messages:
+            return ""
+
+        try:
+            extracted = []
+            user_msgs = []
+            last_correction = None
+
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if not content:
+                    continue
+
+                if role == "user":
+                    user_msgs.append(content)
+                    # Detect corrections
+                    if any(word in content.lower() for word in
+                           ["не так", "wrong", "incorrect", "no,", "нет,", "actually"]):
+                        last_correction = content[:200]
+                elif role == "assistant" and isinstance(content, str):
+                    # Extract notable patterns from assistant responses
+                    for line in content.split("\n"):
+                        ll = line.lower()
+                        if any(word in ll for word in
+                               ["remember:", "note:", "important:", "key insight",
+                                "key takeaway", "lesson learned", "pitfall"]):
+                            extracted.append(line.strip()[:200])
+
+            if not extracted and not last_correction:
+                return ""
+
+            # Save to compressed page
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            session_short = self._session_id[:8] if self._session_id else "unknown"
+
+            entry = f"### Compression snapshot -- {ts} (session {session_short})\n"
+            if extracted:
+                entry += "\n**Extracted notes:**\n"
+                for note in extracted[:10]:
+                    entry += f"- {note}\n"
+            if last_correction:
+                entry += f"\n**Correction:** {last_correction}\n"
+            entry += f"\n_Messages in batch: {len(messages)}_\n\n"
+
+            page_name = f"{COMPRESSED_PAGES_DIR}/{session_short}"
+
+            existing = self._store.read_page(page_name)
+            if existing:
+                new_content = existing["body"] + "\n" + entry
+            else:
+                new_content = (
+                    "# \U0001f4be Compressed Context Snapshots\n\n"
+                    "_Auto-captured before context compression._\n\n"
+                ) + entry
+
+            self._store.write_raw_page(page_name, new_content)
+        except Exception as e:
+            logger.debug("Memory-wiki on_pre_compress: %s", e)
+
+        return ""
+
+    # -- Session end -----------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Compile a session summary to the wiki."""
-        if not self._initialized or not self._store or self._turn_count == 0:
+        if self._session_ended or not self._initialized or not self._store:
             return
+        self._session_ended = True
+
         try:
             session_page = self._store.read_page("_session-history")
-            if not session_page:
-                entries = []
-            else:
-                entries = json.loads(session_page.get("meta", {}).get("sessions", "[]"))
+            entries = []
+            if session_page and "sessions" in session_page.get("meta", {}):
+                try:
+                    entries = json.loads(session_page["meta"]["sessions"])
+                except (json.JSONDecodeError, TypeError):
+                    entries = []
 
-            # Summarize this session
             summary = {
                 "session_id": self._session_id,
                 "turns": self._turn_count,
                 "ended_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "note": "",  # filled in by user or agent
+                "note": "",
             }
             entries.append(summary)
-            # Keep last 20
             entries = entries[-20:]
 
             content = (
-                "# 📋 Session History\n\n"
+                "# \U0001f4cb Session History\n\n"
                 "Auto-recorded sessions summary.\n\n"
                 f"Total sessions logged: {len(entries)}\n\n"
             )
@@ -319,9 +407,90 @@ class MemoryWikiProvider(MemoryProvider):
                 message=f"{self._turn_count} turns",
             )
         except Exception as e:
-            logger.debug("Memory-wiki session_end: %s", e)
+            logger.debug("Memory-wiki on_session_end: %s", e)
 
-    # ── Memory write mirror ────────────────────────────────────────────
+    # -- Session switch (v2: handle /resume, /branch) --------------------
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """Handle session_id rotation (e.g. /resume, /branch, /new).
+
+        v2: properly updates internal session tracking and flushes
+        per-session buffers on reset.
+        """
+        if not new_session_id:
+            return
+
+        # Flush accumulated state if this is a genuinely new conversation
+        if reset:
+            self._turn_count = 0
+            self._session_ended = False
+
+        # Update the tracked session id
+        old_id = self._session_id
+        self._session_id = new_session_id
+
+        logger.debug(
+            "Memory-wiki session switch: %s -> %s (reset=%s)",
+            old_id[:12] if old_id else "none",
+            new_session_id[:12],
+            reset,
+        )
+
+    # -- Delegation (v2: capture subagent results) -----------------------
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs,
+    ) -> None:
+        """Called when a subagent completes.
+
+        Saves the task+result pair to the wiki for future reference.
+        """
+        if not self._initialized or not self._store:
+            return
+        if not task or not result:
+            return
+
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            task_short = task[:80].replace("\n", " ").strip()
+            safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', task_short[:40].lower())
+
+            page_name = f"_delegations/{safe_name or 'task'}"
+            child_id = child_session_id[:8] if child_session_id else "?"
+
+            existing = self._store.read_page(page_name)
+            if existing:
+                body = existing["body"] + f"\n---\n\n### {ts} (child: {child_id})\n\n**Task:** {task_short}\n\n{result}\n"
+            else:
+                body = (
+                    "# \U0001f916 Subagent Delegations\n\n"
+                    "_Auto-captured task+result pairs._\n\n"
+                    f"### {ts} (child: {child_id})\n\n"
+                    f"**Task:** {task_short}\n\n{result}\n"
+                )
+
+            self._store.write_raw_page(page_name, body)
+            self._store._log_entry(
+                action="delegation",
+                target=page_name,
+                message=f"Subagent: {task_short[:60]}",
+            )
+        except Exception as e:
+            logger.debug("Memory-wiki on_delegation: %s", e)
+
+    # -- Memory write mirror ---------------------------------------------
 
     def on_memory_write(
         self,
@@ -332,8 +501,7 @@ class MemoryWikiProvider(MemoryProvider):
     ) -> None:
         """Mirror built-in memory tool writes to wiki pages.
 
-        MEMORY.md entries → environment page
-        USER.md entries   → preferences page
+        v2: replace uses proper old_text matching from metadata.
         """
         if not self._initialized or not self._store or action == "remove":
             return
@@ -341,7 +509,6 @@ class MemoryWikiProvider(MemoryProvider):
         page_name = "preferences" if target == "user" else "environment"
         title = "User Preferences" if target == "user" else "Environment & Conventions"
 
-        # Read existing page
         existing = self._store.read_page(page_name)
         if existing:
             body = existing["body"]
@@ -354,10 +521,36 @@ class MemoryWikiProvider(MemoryProvider):
             entry = f"- {content}\n"
             if entry not in body:
                 body += entry
+
         elif action == "replace":
-            # old text comes from metadata
-            if metadata and "old_text" in metadata:
-                body = body.replace(metadata["old_text"], content)
+            # v2: use metadata.old_text for precise matching
+            old_text = ""
+            if metadata and isinstance(metadata, dict):
+                old_text = metadata.get("old_text", "")
+
+            if old_text and old_text in body:
+                # Replace the old_text line specifically
+                body = body.replace(f"- {old_text}", f"- {content}", 1)
+            else:
+                # Fallback: find any entry containing old_text substring
+                # Look for list items containing the old_text
+                lines = body.split("\n")
+                new_lines = []
+                replaced = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not replaced and stripped.startswith("- ") and old_text and old_text in stripped:
+                        new_lines.append(f"- {content}" if line.startswith("-") else f"  - {content}")
+                        replaced = True
+                    else:
+                        new_lines.append(line)
+                if replaced:
+                    body = "\n".join(new_lines)
+                else:
+                    # If nothing matched, just append
+                    entry = f"- {content}\n"
+                    if entry not in body:
+                        body += entry
 
         self._store.write_page(
             page_name,
@@ -366,7 +559,7 @@ class MemoryWikiProvider(MemoryProvider):
             commit_message=f"{action} builtin-{target}: {content[:60]}",
         )
 
-    # ── Tools ──────────────────────────────────────────────────────────
+    # -- Tools -----------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
@@ -378,29 +571,27 @@ class MemoryWikiProvider(MemoryProvider):
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Dispatch wiki tool calls."""
         if not self._initialized or not self._store:
             return json.dumps({
                 "success": False,
-                "error": "Memory-wiki not initialized. Check ~/.hermes/plugins/memory-wiki/",
+                "error": "Memory-wiki not initialized.",
             }, ensure_ascii=False)
 
         try:
-            if tool_name == "wiki_search":
-                return self._handle_search(args)
-            elif tool_name == "wiki_read":
-                return self._handle_read(args)
-            elif tool_name == "wiki_write":
-                return self._handle_write(args)
-            elif tool_name == "wiki_ls":
-                return self._handle_ls(args)
-            elif tool_name == "wiki_stats":
-                return self._handle_stats()
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": f"Unknown tool: {tool_name}",
-                }, ensure_ascii=False)
+            handlers = {
+                "wiki_search": self._handle_search,
+                "wiki_read": self._handle_read,
+                "wiki_write": self._handle_write,
+                "wiki_ls": self._handle_ls,
+                "wiki_stats": self._handle_stats,
+            }
+            handler = handlers.get(tool_name)
+            if handler:
+                return handler(args)
+            return json.dumps({
+                "success": False,
+                "error": f"Unknown tool: {tool_name}",
+            }, ensure_ascii=False)
         except Exception as e:
             logger.error("Memory-wiki tool %s failed: %s", tool_name, e, exc_info=True)
             return json.dumps({
@@ -430,7 +621,6 @@ class MemoryWikiProvider(MemoryProvider):
             return json.dumps({"success": False, "error": "Page name is required."}, ensure_ascii=False)
         page = self._store.read_page(name)
         if not page:
-            # Suggest similar pages
             all_pages = self._store.list_pages()
             suggestions = [p["name"] for p in all_pages if name.lower() in p["name"].lower()]
             msg = f"Page '{name}' not found."
@@ -482,10 +672,9 @@ class MemoryWikiProvider(MemoryProvider):
             "stats": stats,
         }, ensure_ascii=False)
 
-    # ── Config ─────────────────────────────────────────────────────────
+    # -- Config ----------------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
-        """Declare config fields for 'hermes memory setup'."""
         return [
             {
                 "key": "wiki_root",
@@ -512,12 +701,10 @@ class MemoryWikiProvider(MemoryProvider):
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        """Write plugin config to memory-wiki/config.json."""
         config_dir = Path(hermes_home) / "memory-wiki"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "plugin-config.json"
 
-        # Only persist non-empty, non-default values
         config = {}
         if values.get("wiki_root"):
             config["wiki_root"] = values["wiki_root"]
@@ -537,10 +724,9 @@ class MemoryWikiProvider(MemoryProvider):
         elif config_path.exists():
             config_path.unlink()
 
-    # ── Shutdown ───────────────────────────────────────────────────────
+    # -- Shutdown --------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Flush and close the wiki store."""
         if self._store:
             try:
                 self._store.close()
@@ -556,5 +742,4 @@ class MemoryWikiProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    """Register the memory-wiki provider with the plugin system."""
     ctx.register_memory_provider(MemoryWikiProvider())

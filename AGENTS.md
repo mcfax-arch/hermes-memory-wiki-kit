@@ -10,16 +10,21 @@ The plugin is at `plugins/memory-wiki/`. Install it to `{HERMES_HOME}/plugins/me
 The old SKILL.md + AGENTS.md approach with `{MEMORY_ROOT}` is **replaced** by a proper
 Hermes MemoryProvider plugin. The plugin handles:
 - Lifecycle (initialize, prefetch, sync, shutdown)
-- FTS5 full-text search via SQLite
+- FTS5 full-text search via SQLite with recency + tag boost
 - Tool schemas (wiki_search, wiki_read, wiki_write, wiki_ls, wiki_stats)
-- Mirroring built-in memory writes to wiki pages
-- Automatic context injection before each turn
+- Mirroring built-in memory writes to wiki pages (preferences, environment)
+- Automatic context injection before each turn (with recency + tag scoring)
+- Pre-compression capture (saves notes and corrections before context compression)
+- Session switch handling (/resume, /branch, /new)
+- Delegation capture (records subagent task+result pairs)
+- Log auto-trimming at 500 entries
+- Auto-indexing of existing .md files at startup
 
 ## How to install
 
 ```bash
-cp -r plugins/memory-wiki {HERMES_HOME}/plugins/
-hermes memory setup      # select memory-wiki
+cp -r plugins/memory_wiki {HERMES_HOME}/plugins/
+hermes memory setup      # select memory_wiki
 hermes                   # start new session
 ```
 

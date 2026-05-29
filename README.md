@@ -10,12 +10,12 @@
 
 ```bash
 # 1. Скопировать плагин в директорию плагинов Hermes:
-cp -r plugins/memory-wiki ~/AppData/Local/hermes/plugins/   # Windows
-# cp -r plugins/memory-wiki ~/.hermes/plugins/              # macOS/Linux
+cp -r plugins/memory_wiki ~/AppData/Local/hermes/plugins/   # Windows
+# cp -r plugins/memory_wiki ~/.hermes/plugins/              # macOS/Linux
 
 # 2. Активировать через CLI:
 hermes memory setup
-# → Выбрать "memory-wiki" из списка
+# → Выбрать "memory_wiki" из списка
 
 # 3. Начать новую сессию:
 hermes
@@ -29,12 +29,15 @@ hermes
 
 | Хук | Что делает |
 |---|---|
-| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс |
-| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
-| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы wiki → подставляет в контекст |
-| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
-| `on_session_end(messages)` | Записывает сводку сессии в `_session-history.md` |
-| `shutdown()` | Закрывает хранилище |
+|| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс + авто-индексация существующих .md |
+|| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
+|| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы (FTS5 + буст по свежести и тегам) |
+|| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
+|| `on_pre_compress(messages)` | Сохраняет заметки и коррекции перед сжатием контекста |
+|| `on_delegation(task, result)` | Сохраняет результаты субэйджентов |
+|| `on_session_switch(new_id)` | Корректно обновляет session_id при /resume, /branch |
+|| `on_session_end(messages)` | Записывает сводку сессии в `_session-history.md` |
+|| `shutdown()` | Закрывает хранилище |
 
 ### Инструменты
 
@@ -95,7 +98,7 @@ python tools/memory-autopilot.py --memory-root ~/.hermes/memory-wiki
 ## Структура плагина
 
 ```
-plugins/memory-wiki/
+plugins/memory_wiki/
 ├── __init__.py       # MemoryWikiProvider(MemoryProvider) — жизненный цикл + tools
 ├── store.py          # WikiStore — Markdown CRUD + SQLite FTS5
 ├── plugin.yaml       # Метаданные для обнаружения плагина
