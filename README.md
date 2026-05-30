@@ -1,8 +1,8 @@
-# 📝 Hermes Memory Wiki Kit
+# 📝 Hermes Memory Wiki Kit v3
 
-**Нативный MemoryProvider плагин** для Hermes Agent — постоянная память в виде Markdown wiki с FTS5-поиском, авто-префетчем и синхронизацией со встроенной памятью.
+**Нативный MemoryProvider плагин** для Hermes Agent — постоянная память в виде Markdown wiki с FTS5-поиском, графом ссылок, быстрыми захватами (captures) и автопилотом.
 
-> 🚀 **Что изменилось**: старый подход на SKILL.md + AGENTS.md заменён на настоящий [MemoryProvider плагин](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin). Работает через `hermes memory setup`, не требует ручной загрузки скилла.
+> 🚀 **v3** — link graph (`[[wiki-links]]`), captures, autopilot, health reporting, 9 инструментов.
 
 ---
 
@@ -17,11 +17,13 @@ cp -r plugins/memory_wiki ~/AppData/Local/hermes/plugins/   # Windows
 hermes memory setup
 # → Выбрать "memory_wiki" из списка
 
-# 3. Начать новую сессию:
+# 3. Перезапустить Hermes:
 hermes
 ```
 
-Всё. Никаких API-ключей, конфигов или внешних зависимостей.
+## Для тех, кто обновляется с v2
+
+Плагин имеет авто-миграцию — новые SQLite таблицы (`links`, `captures`, `signals`) создаются автоматически при первой загрузке. После копирования файлов достаточно перезапустить Hermes.
 
 ## Как это работает
 
@@ -29,42 +31,87 @@ hermes
 
 | Хук | Что делает |
 |---|---|
-|| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс + авто-индексация существующих .md |
-|| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
-|| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы (FTS5 + буст по свежести и тегам) |
-|| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
-|| `on_pre_compress(messages)` | Сохраняет заметки и коррекции перед сжатием контекста |
-|| `on_delegation(task, result)` | Сохраняет результаты субэйджентов |
-|| `on_session_switch(new_id)` | Корректно обновляет session_id при /resume, /branch |
-|| `on_session_end(messages)` | Записывает сводку сессии в `_session-history.md` |
-|| `shutdown()` | Закрывает хранилище |
+| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс + авто-индексация существующих .md |
+| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
+| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы (FTS5 + буст по свежести, тегам и tier) |
+| `sync_turn(user, assistant)` | **v3: Autopilot** — сканирует сигналы (коррекции, решения, предпочтения), авто-capture при score > 8 |
+| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
+| `on_pre_compress(messages)` | **v3:** Усиленный анализ + авто-capture высоко-скоренных сигналов |
+| `on_delegation(task, result)` | Сохраняет результаты субэйджентов |
+| `on_session_switch(new_id)` | Корректно обновляет session_id при /resume, /branch |
+| `on_session_end(messages)` | Записывает сводку сессии + авто-capture сигналов за сессию |
+| `shutdown()` | Закрывает хранилище |
 
-### Инструменты
+### Инструменты (9)
 
-| Инструмент | Описание |
-|---|---|
-| `wiki_search(query, limit)` | FTS5-поиск с BM25-ранжированием, возвращает сниппеты |
-| `wiki_read(name)` | Читает страницу wiki по имени |
-| `wiki_write(name, content, message)` | Создаёт/обновляет страницу (Markdown + YAML frontmatter) |
-| `wiki_ls(sort)` | Список всех страниц с заголовками и тегами |
-| `wiki_stats()` | Статистика хранилища |
+| Инструмент | Описание | v3 |
+|---|---|---|
+| `wiki_search(query, limit)` | FTS5-поиск с BM25 + recency/tier/tag boost | ✓ |
+| `wiki_read(name)` | Читает страницу wiki по имени | ✓ |
+| `wiki_write(name, content, message)` | Создаёт/обновляет страницу (Markdown + YAML frontmatter) | ✓ |
+| `wiki_ls(sort)` | Список всех страниц с заголовками и тегами | ✓ |
+| `wiki_stats()` | Статистика хранилища | ✓ |
+| **`wiki_capture(content, tags)`** | Быстрый захват факта без создания полной страницы | **new** |
+| **`wiki_graph(name)`** | Граф связей страницы (кто на кого ссылается) | **new** |
+| **`wiki_tags(tag)`** | Просмотр страниц по тегам | **new** |
+| **`wiki_health()`** | Health report: orphans, broken links, tiers, backlog, score | **new** |
 
 ## Структура на диске
 
 ```
 {HERMES_HOME}/memory-wiki/
 ├── wiki/
-│   ├── preferences.md      # Зеркало USER.md
-│   ├── environment.md      # Зеркало MEMORY.md
-│   ├── index.md            # Авто-оглавление
-│   └── ...                 # Ваши страницы
-├── index.md                # TOC (авто)
-├── log.md                  # Журнал изменений (авто)
-├── plugin-config.json      # Конфиг
+│   ├── preferences.md          # Зеркало USER.md
+│   ├── environment.md          # Зеркало MEMORY.md
+│   ├── index.md                # Авто-оглавление
+│   ├── _captures/              # v3: Быстрые захваты (*.md файлы)
+│   │   └── capture-20250530-120000.md
+│   ├── _compressed/            # Слепки сжатия контекста
+│   ├── _delegations/           # Результаты субэйджентов
+│   ├── _session-history.md     # История сессий
+│   └── ...                     # Ваши страницы
+├── index.md                    # TOC (авто)
+├── log.md                      # Журнал изменений (авто)
+├── plugin-config.json          # Конфиг
 └── .state/
-    ├── search.db           # SQLite FTS5-индекс (авто)
-    └── link_graph.json     # Граф ссылок (опционально)
+    ├── search.db               # SQLite FTS5 + links + captures + signals (авто)
 ```
+
+## Link Graph
+
+Создавайте связи между страницами через `[[wiki-links]]` прямо в Markdown:
+
+```markdown
+# Моя страница
+
+Эта концепция связана с [[preferences]] и [[environment]].
+
+Смотри также:
+- [[projects/my-app]]
+```
+
+Плагин автоматически отслеживает:
+
+- **Outgoing:** какие страницы упоминаются
+- **Incoming:** какие страницы ссылаются на эту
+- **Orphans:** страницы без единой связи
+- **Broken links:** `[[ссылки]]`, ведущие в никуда
+
+Используйте `wiki_graph(name)` для просмотра связей и `wiki_health()` для проверки целостности.
+
+## Autopilot
+
+Автоматическое обнаружение важных сигналов:
+
+| Сигнал | Score | Пример |
+|---|---|---|
+| Коррекция | 5.0 | "Нет, это не так, надо иначе" |
+| Решение | 4.0 | "Давай попробуем Kaspersky" |
+| Предпочтение | 4.0 | "Я предпочитаю бесплатные модели" |
+| Конфиг/путь | 2.0 | "config.yaml: model.context_length=..." |
+| URL | 1.0 | "https://example.com/api" |
+
+При суммарном score > 8 — авто-сохранение в captures. Всё автоматически, без участия пользователя.
 
 ## Сравнение: Built-in vs Wiki
 
@@ -72,40 +119,49 @@ hermes
 |---|---|---|
 | Размер | 2 200 + 1 375 символов | Безлимит (диск) |
 | Формат | `§`-разделённые записи | Markdown-файлы |
-| Поиск | Нет (вставляется как есть) | FTS5-полнотекстовый поиск |
-| Редактирование | Через `memory` tool | Через tools + напрямую в файлах |
+| Поиск | Нет (вставляется как есть) | FTS5 + link graph |
+| Редактирование | Через `memory` tool | Через 9 tools + напрямую в файлах |
 | Для чего | Быстрые заметки, поверхностные факты | Глубокое структурированное знание |
 
-Работают вместе. Built-in — для компактных фактов, которые всегда в system prompt. Wiki — для глубины.
+Работают вместе. Built-in — для компактных фактов, всегда в system prompt. Wiki — для глубины, связей и истории.
 
-## Инструменты обслуживания
+## Инструменты обслуживания (CLI)
 
-В `tools/` — standalone Python-скрипты:
+В `tools/` — standalone Python-скрипты, работающие без Hermes:
 
 ```bash
-# Линтер: битые ссылки, устаревшие страницы
-python tools/lint_wiki.py wiki/
+# Быстрый захват факта из командной строки
+python tools/wiki-capture.py "KPM service restarts on boot" --tags windows kpm
 
-# Граф ссылок между страницами
-python tools/memory-graph.py --memory-root ~/.hermes/memory-wiki
+# Список непромоученных захватов
+python tools/wiki-capture.py --list --unpromoted
 
-# Автопилот: все задачи обслуживания
-python tools/memory-autopilot.py --memory-root ~/.hermes/memory-wiki
+# Полное обслуживание (decay + promote captures + health)
+python tools/wiki-maintenance.py
+
+# Health report
+python tools/wiki-maintenance.py --health
+
+# Link graph report
+python tools/wiki-maintenance.py --graph
+
+# Decay pass только
+python tools/wiki-maintenance.py --decay
 ```
 
-Работают без Hermes. Можно в cron/Task Scheduler.
+Можно поставить в cron / Task Scheduler для ежедневного обслуживания.
 
 ## Структура плагина
 
 ```
 plugins/memory_wiki/
-├── __init__.py       # MemoryWikiProvider(MemoryProvider) — жизненный цикл + tools
-├── store.py          # WikiStore — Markdown CRUD + SQLite FTS5
-├── plugin.yaml       # Метаданные для обнаружения плагина
+├── __init__.py       # MemoryWikiProvider(MemoryProvider) — жизненный цикл + 9 tools
+├── store.py          # WikiStore — Markdown CRUD + SQLite FTS5 + links + captures
+├── plugin.yaml       # Метаданные (v3.0.0)
 └── README.md         # Документация плагина
 ```
 
-Ноль зависимостей. Использует: `os`, `re`, `json`, `sqlite3`, `threading`, `pathlib`, `logging`.
+Ноль внешних зависимостей. Использует: `os`, `re`, `json`, `sqlite3`, `threading`, `pathlib`, `logging`.
 
 ## Конфигурация
 
@@ -113,7 +169,7 @@ plugins/memory_wiki/
 
 - `wiki_root` — путь (по умолч.: `{HERMES_HOME}/memory-wiki`)
 - `prefetch_limit` — макс. страниц на turn (по умолч.: 3)
-- `auto_capture` — зеркалирование built-in памяти (по умолч.: true)
+- `auto_capture` — зеркалирование built-in памяти + autopilot (по умолч.: true)
 
 Или через `plugin-config.json` в корне wiki.
 
@@ -123,14 +179,9 @@ plugins/memory_wiki/
 - Python 3.10+
 - SQLite3 (встроен в Python)
 
-## Как перенестись со старого Kit
+## Changelog
 
-Если использовали старый подход с `{MEMORY_ROOT}`:
-
-1. Переместите существующие wiki-страницы в `{HERMES_HOME}/memory-wiki/wiki/`
-2. Запустите `python tools/lint_wiki.py` для проверки
-3. Удалите старый `{MEMORY_ROOT}`
-4. Плагин дальше всё делает сам
+См. [CHANGELOG.md](CHANGELOG.md) — от v1 до v3.
 
 ## Лицензия
 

@@ -1,6 +1,6 @@
 name: memory_wiki
-version: 2.0.0
-description: "Persistent Markdown wiki memory. Local-first, no API key needed. Editable .md files with FTS5 search, auto-prefetch, pre-compress capture, delegation capture, and auto-sync from built-in memory."
+version: 3.0.0
+description: "Persistent Markdown wiki memory v3. Captures, link graph, autopilot, health reporting. 9 tools: wiki_search/read/write/capture/graph/tags/ls/stats/health."
 hooks:
   - on_session_end
   - on_memory_write

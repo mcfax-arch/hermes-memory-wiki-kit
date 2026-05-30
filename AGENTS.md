@@ -3,42 +3,44 @@
 ## Context for Hermes Agent
 
 This repository contains a **MemoryProvider plugin** for Hermes Agent.
-The plugin is at `plugins/memory-wiki/`. Install it to `{HERMES_HOME}/plugins/memory-wiki/`.
+The plugin is at `plugins/memory_wiki/`. Install it to `{HERMES_HOME}/plugins/memory_wiki/`.
 
-## What changed
+## What's new in v3
 
-The old SKILL.md + AGENTS.md approach with `{MEMORY_ROOT}` is **replaced** by a proper
-Hermes MemoryProvider plugin. The plugin handles:
-- Lifecycle (initialize, prefetch, sync, shutdown)
-- FTS5 full-text search via SQLite with recency + tag boost
-- Tool schemas (wiki_search, wiki_read, wiki_write, wiki_ls, wiki_stats)
-- Mirroring built-in memory writes to wiki pages (preferences, environment)
-- Automatic context injection before each turn (with recency + tag scoring)
-- Pre-compression capture (saves notes and corrections before context compression)
-- Session switch handling (/resume, /branch, /new)
-- Delegation capture (records subagent task+result pairs)
-- Log auto-trimming at 500 entries
-- Auto-indexing of existing .md files at startup
+The plugin now provides **9 tools** for persistent Markdown wiki memory:
 
-## How to install
+- **wiki_search/read/write** — core CRUD (FTS5 search)
+- **wiki_capture** — quick fact capture (new in v3)
+- **wiki_graph** — link graph from [[wiki-links]] (new in v3)
+- **wiki_tags** — browse by tags (new in v3)
+- **wiki_ls/stats/health** — listing, stats, health reports
+
+### Key improvements over v2
+
+- **Link graph**: `[[wiki-links]]` auto-tracked in SQLite. `wiki_graph(name)` shows outgoing + incoming connections. `wiki_health()` finds orphans and broken links.
+- **Capture system**: One-liner fact capture via `wiki_capture(content, tags)`. Stored in `wiki/_captures/`. CLI: `tools/wiki-capture.py`.
+- **Autopilot**: Always-on signal detection. In `sync_turn` and `on_pre_compress`, messages are scored for corrections (5), decisions (4), preferences (4), config paths (2), URLs (1). Auto-capture when score > 8.
+- **Health**: `wiki_health()` returns page count, tier distribution, orphans, broken links, capture backlog, health score.
+
+### Hooks
+
+The plugin hooks into Hermes lifecycle:
+- `on_session_end` — session summary + auto-capture of session signals
+- `on_memory_write` — mirrors built-in memory to wiki pages
+- `on_pre_compress` — enhanced v3: signal scoring + auto-capture + note extraction
+- `on_session_switch` — handles /resume, /branch, /new
+- `on_delegation` — captures subagent task+result pairs
+
+### CLI tools (standalone, work without Hermes)
 
 ```bash
-cp -r plugins/memory_wiki {HERMES_HOME}/plugins/
-hermes memory setup      # select memory_wiki
-hermes                   # start new session
+# Quick capture
+python tools/wiki-capture.py "fact" --tags "tag1 tag2"
+
+# Full maintenance (decay + promote + health + graph)
+python tools/wiki-maintenance.py [--decay] [--promote] [--health] [--graph]
 ```
 
-## Migration from old kit
+### Migration from v2
 
-If migrating from the old `{MEMORY_ROOT}`-based approach:
-1. Copy old wiki pages into `{HERMES_HOME}/memory-wiki/wiki/`
-2. Run `python tools/lint_wiki.py` to validate
-3. Delete old `{MEMORY_ROOT}` if desired
-
-The plugin handles everything — no more manual skill loading, no more `{MEMORY_ROOT}`
-placeholder replacement, no more fragile AGENTS.md routing rules.
-
-## tools/
-
-Standalone Python scripts for wiki maintenance (lint, graph, autopilot).
-These are optional — the plugin works without them.
+Copy the updated `plugins/memory_wiki/` directory. On first load, the SQLite database is automatically migrated with new tables (links, captures, signals). No manual steps needed.

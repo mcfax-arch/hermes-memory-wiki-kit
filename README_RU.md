@@ -1,8 +1,8 @@
-# 📝 Hermes Memory Wiki Kit
+# 📝 Hermes Memory Wiki Kit v3
 
-**Нативный MemoryProvider плагин** для Hermes Agent — постоянная память в виде Markdown wiki с FTS5-поиском, авто-префетчем и синхронизацией со встроенной памятью.
+**Нативный MemoryProvider плагин** для Hermes Agent — постоянная память в виде Markdown wiki с FTS5-поиском, графом ссылок, быстрыми захватами (captures) и автопилотом.
 
-> 🚀 **Что изменилось**: старый подход на SKILL.md + AGENTS.md заменён на настоящий [MemoryProvider плагин](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin). Работает через `hermes memory setup`, не требует ручной загрузки скилла.
+> 🚀 **v3** — link graph (`[[wiki-links]]`), captures, autopilot, health reporting, 9 инструментов.
 
 ---
 
@@ -10,124 +10,84 @@
 
 ```bash
 # 1. Скопировать плагин в директорию плагинов Hermes:
-cp -r plugins/memory-wiki ~/AppData/Local/hermes/plugins/   # Windows
-# cp -r plugins/memory-wiki ~/.hermes/plugins/              # macOS/Linux
+cp -r plugins/memory_wiki ~/AppData/Local/hermes/plugins/   # Windows
+# cp -r plugins/memory_wiki ~/.hermes/plugins/              # macOS/Linux
 
 # 2. Активировать через CLI:
 hermes memory setup
-# → Выбрать "memory-wiki" из списка
+# → Выбрать "memory_wiki" из списка
 
-# 3. Начать новую сессию:
+# 3. Перезапустить Hermes:
 hermes
 ```
 
-Всё. Никаких API-ключей, конфигов или внешних зависимостей.
+## Для тех, кто обновляется с v2
+
+Плагин имеет авто-миграцию — новые SQLite таблицы (`links`, `captures`, `signals`) создаются автоматически при первой загрузке. После копирования файлов достаточно перезапустить Hermes.
 
 ## Как это работает
 
-Плагин реализует `MemoryProvider` ABC и встраивается в жизненный цикл Hermes:
+Плагин реализует `MemoryProvider` ABC и встраивается в жизненный цикл Hermes.
 
-| Хук | Что делает |
-|---|---|
-| `initialize()` | Создаёт wiki-директорию + SQLite FTS5-индекс |
-| `system_prompt_block()` | Добавляет описание инструментов в system prompt |
-| `prefetch(query)` | Перед каждым turn-ом ищет релевантные страницы wiki → подставляет в контекст |
-| `on_memory_write(action, target, content)` | Зеркалирует записи встроенной `memory` в wiki-страницы |
-| `on_session_end(messages)` | Записывает сводку сессии в `_session-history.md` |
-| `shutdown()` | Закрывает хранилище |
-
-### Инструменты
+### Инструменты (9)
 
 | Инструмент | Описание |
 |---|---|
-| `wiki_search(query, limit)` | FTS5-поиск с BM25-ранжированием, возвращает сниппеты |
-| `wiki_read(name)` | Читает страницу wiki по имени |
-| `wiki_write(name, content, message)` | Создаёт/обновляет страницу (Markdown + YAML frontmatter) |
-| `wiki_ls(sort)` | Список всех страниц с заголовками и тегами |
-| `wiki_stats()` | Статистика хранилища |
+| `wiki_search(query, limit)` | FTS5-поиск с BM25 + recency/tier/tag boost |
+| `wiki_read(name)` | Читает страницу wiki |
+| `wiki_write(name, content, message)` | Создаёт/обновляет страницу |
+| `wiki_capture(content, tags)` | **NEW** Быстрый захват факта |
+| `wiki_graph(name)` | **NEW** Граф связей (кто на кого ссылается) |
+| `wiki_tags(tag)` | **NEW** Просмотр по тегам |
+| `wiki_ls(sort)` | Список страниц |
+| `wiki_stats()` | Статистика |
+| `wiki_health()` | **NEW** Health report |
+
+### Link Graph
+
+Создавайте связи через `[[wiki-links]]` в Markdown. Плагин отслеживает outgoing/incoming связи, находит orphan-страницы и broken links.
+
+### Autopilot
+
+Автоматическое обнаружение сигналов (коррекции, решения, предпочтения). При score > 8 — авто-capture. Всё без участия пользователя.
+
+## Инструменты обслуживания (CLI)
+
+```bash
+# Быстрый захват
+python tools/wiki-capture.py "факт" --tags "tag1 tag2"
+
+# Полное обслуживание
+python tools/wiki-maintenance.py
+
+# Health report
+python tools/wiki-maintenance.py --health
+
+# Link graph
+python tools/wiki-maintenance.py --graph
+```
 
 ## Структура на диске
 
 ```
 {HERMES_HOME}/memory-wiki/
 ├── wiki/
-│   ├── preferences.md      # Зеркало USER.md
-│   ├── environment.md      # Зеркало MEMORY.md
-│   ├── index.md            # Авто-оглавление
-│   └── ...                 # Ваши страницы
-├── index.md                # TOC (авто)
-├── log.md                  # Журнал изменений (авто)
-├── plugin-config.json      # Конфиг
+│   ├── preferences.md       # Зеркало USER.md
+│   ├── environment.md       # Зеркало MEMORY.md
+│   ├── _captures/           # Быстрые захваты
+│   ├── index.md             # Авто-оглавление
+│   └── ...                  # Ваши страницы
+├── index.md                 # TOC (авто)
+├── log.md                   # Журнал (авто)
 └── .state/
-    ├── search.db           # SQLite FTS5-индекс (авто)
-    └── link_graph.json     # Граф ссылок (опционально)
+    └── search.db            # SQLite FTS5 + links + captures
 ```
-
-## Сравнение: Built-in vs Wiki
-
-| | Built-in (MEMORY.md/USER.md) | Wiki (этот плагин) |
-|---|---|---|
-| Размер | 2 200 + 1 375 символов | Безлимит (диск) |
-| Формат | `§`-разделённые записи | Markdown-файлы |
-| Поиск | Нет (вставляется как есть) | FTS5-полнотекстовый поиск |
-| Редактирование | Через `memory` tool | Через tools + напрямую в файлах |
-| Для чего | Быстрые заметки, поверхностные факты | Глубокое структурированное знание |
-
-Работают вместе. Built-in — для компактных фактов, которые всегда в system prompt. Wiki — для глубины.
-
-## Инструменты обслуживания
-
-В `tools/` — standalone Python-скрипты:
-
-```bash
-# Линтер: битые ссылки, устаревшие страницы
-python tools/lint_wiki.py wiki/
-
-# Граф ссылок между страницами
-python tools/memory-graph.py --memory-root ~/.hermes/memory-wiki
-
-# Автопилот: все задачи обслуживания
-python tools/memory-autopilot.py --memory-root ~/.hermes/memory-wiki
-```
-
-Работают без Hermes. Можно в cron/Task Scheduler.
-
-## Структура плагина
-
-```
-plugins/memory-wiki/
-├── __init__.py       # MemoryWikiProvider(MemoryProvider) — жизненный цикл + tools
-├── store.py          # WikiStore — Markdown CRUD + SQLite FTS5
-├── plugin.yaml       # Метаданные для обнаружения плагина
-└── README.md         # Документация плагина
-```
-
-Ноль зависимостей. Использует: `os`, `re`, `json`, `sqlite3`, `threading`, `pathlib`, `logging`.
-
-## Конфигурация
-
-Через `hermes memory setup`:
-
-- `wiki_root` — путь (по умолч.: `{HERMES_HOME}/memory-wiki`)
-- `prefetch_limit` — макс. страниц на turn (по умолч.: 3)
-- `auto_capture` — зеркалирование built-in памяти (по умолч.: true)
-
-Или через `plugin-config.json` в корне wiki.
 
 ## Требования
 
-- Hermes Agent (любая версия с `MemoryProvider` ABC, 2025+)
+- Hermes Agent 2025+
 - Python 3.10+
 - SQLite3 (встроен в Python)
-
-## Как перенестись со старого Kit
-
-Если использовали старый подход с `{MEMORY_ROOT}`:
-
-1. Переместите существующие wiki-страницы в `{HERMES_HOME}/memory-wiki/wiki/`
-2. Запустите `python tools/lint_wiki.py` для проверки
-3. Удалите старый `{MEMORY_ROOT}`
-4. Плагин дальше всё делает сам
 
 ## Лицензия
 

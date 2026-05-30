@@ -1,19 +1,15 @@
-"""Memory Wiki Plugin v2 -- persistent Markdown wiki memory for Hermes Agent.
+"""Memory Wiki Plugin v3 -- with captures, link graph, and autopilot.
 
 Provides a proper MemoryProvider implementation that stores durable
-knowledge as editable Markdown files with FTS5 search.  Complements
-the built-in memory (MEMORY.md/USER.md) which stays for quick surface
-facts -- wiki is for depth.
+knowledge as editable Markdown files with FTS5 search, link graph,
+quick-capture system, and always-on autopilot signal detection.
 
-v2 improvements:
-  - Renamed to memory_wiki (underscore, not hyphen -- PEP 8 compliant)
-  - Auto-indexes existing .md files at startup
-  - on_pre_compress hook -- saves compressed messages to wiki
-  - on_session_switch -- handles /resume, /branch cleanly
-  - on_delegation -- captures subagent task+result pairs
-  - on_memory_write replace -- proper entry-based matching
-  - Prefetch with recency + tag boost scoring
-  - Log auto-trimming at 500 entries
+v3 additions:
+  - Capture system: wiki_capture tool + auto-promote maintenance
+  - Link graph: [[wiki-links]] are auto-tracked, wiki_graph tool
+  - Health reporting: wiki_health tool (orphans, broken links, tiers, backlog)
+  - Autopilot: signal scoring in on_pre_compress and sync_turn
+  - wiki_tags tool: browse wiki by tags
 """
 
 from __future__ import annotations
@@ -21,8 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,9 +37,18 @@ DEFAULT_PREFETCH_LIMIT = 3
 DEFAULT_AUTO_CAPTURE = True
 COMPRESSED_PAGES_DIR = "_compressed"
 
+# Autopilot scoring thresholds
+AUTOPILOT_CAPTURE_THRESHOLD = 8.0  # cumulative score triggers auto-capture
+SIGNAL_CORRECTION = 5.0
+SIGNAL_DECISION = 4.0
+SIGNAL_PREFERENCE = 4.0
+SIGNAL_CODE = 2.0
+SIGNAL_URL = 1.0
+SIGNAL_LONG = 0.5  # per line of notable content
+
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tool schemas
 # ---------------------------------------------------------------------------
 
 WIKI_SEARCH_SCHEMA = {
@@ -105,7 +110,9 @@ WIKI_WRITE_SCHEMA = {
         "- Session progress, current task state, temporary details\n"
         "- Things easily re-fetched from source\n"
         "- Trivial one-off facts\n"
-        "\nUse descriptive page names like: 'preferences', 'environment', 'projects/my-project', 'workflows/deploy'."
+        "\nUse descriptive page names like: 'preferences', 'environment', 'projects/my-project', 'workflows/deploy'.\n"
+        "\nTIP: Use [[wiki-links]] (double-bracket notation) to connect pages "
+        "-- they're auto-tracked in the link graph!"
     ),
     "parameters": {
         "type": "object",
@@ -150,11 +157,86 @@ WIKI_LS_SCHEMA = {
 WIKI_STATS_SCHEMA = {
     "name": "wiki_stats",
     "description": (
-        "Show memory wiki statistics: page count, total size, storage path."
+        "Show memory wiki statistics: page count, total size, storage path, tier distribution."
     ),
     "parameters": {
         "type": "object",
         "properties": {},
+    },
+}
+
+WIKI_CAPTURE_SCHEMA = {
+    "name": "wiki_capture",
+    "description": (
+        "Quickly save a fact or observation to the memory wiki. "
+        "Use this when something is worth remembering but doesn't need a full wiki page yet -- "
+        "e.g. a user preference, environment detail, project observation, or error lesson. "
+        "Captures are stored separately and can be promoted to full wiki pages later via maintenance."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The fact or observation to save. Markdown allowed. Keep it concise."
+            },
+            "tags": {
+                "type": "string",
+                "description": "Space or comma-separated tags for categorization (e.g. 'hermes config error').",
+                "default": "",
+            },
+        },
+        "required": ["content"],
+    },
+}
+
+WIKI_GRAPH_SCHEMA = {
+    "name": "wiki_graph",
+    "description": (
+        "Show the link graph for a wiki page: which pages it links to and which pages link to it. "
+        "Links are created automatically from [[wiki-links]] in page content. "
+        "Use this to discover connections between pages and find related information."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Page name to inspect (e.g. 'preferences'). Use wiki_ls to list pages."
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+WIKI_HEALTH_SCHEMA = {
+    "name": "wiki_health",
+    "description": (
+        "Get a comprehensive health report for the memory wiki: "
+        "page count, tier distribution (active/warm/stale), orphan pages "
+        "(pages with no incoming or outgoing links), broken links "
+        "([[targets]] that don't exist), capture backlog, and overall health score."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+WIKI_TAGS_SCHEMA = {
+    "name": "wiki_tags",
+    "description": (
+        "List or search wiki pages by tags. "
+        "Returns pages with matching tags, grouped by tag."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tag": {
+                "type": "string",
+                "description": "Optional tag to filter by. Omit to see all tags."
+            },
+        },
     },
 }
 
@@ -164,7 +246,7 @@ WIKI_STATS_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 class MemoryWikiProvider(MemoryProvider):
-    """Markdown wiki memory provider for Hermes Agent, v2."""
+    """Markdown wiki memory provider for Hermes Agent, v3."""
 
     def __init__(self):
         self._store: WikiStore | None = None
@@ -178,7 +260,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._platform: str = "cli"
         self._session_ended: bool = False
 
-    # -- Core lifecycle --------------------------------------------------
+    # -- Core lifecycle ------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -216,34 +298,37 @@ class MemoryWikiProvider(MemoryProvider):
 
             self._initialized = True
             logger.info(
-                "Memory-wiki v2 initialized at %s (session=%s)",
+                "Memory-wiki v3 initialized at %s (session=%s)",
                 root, session_id,
             )
         except Exception as e:
             logger.warning("Failed to initialize memory-wiki store: %s", e)
             self._initialized = False
 
-    # -- System prompt block ---------------------------------------------
+    # -- System prompt block -------------------------------------------
 
     def system_prompt_block(self) -> str:
         if not self._initialized:
             return ""
         return (
-            "\U0001f4da MEMORY WIKI (persistent)\n"
+            "📚 MEMORY WIKI (persistent)\n"
             "You have a persistent Markdown wiki at your disposal:\n"
-            "  wiki_search(query) -- search stored knowledge (FTS5 + recency boost)\n"
-            "  wiki_read(name)    -- read a wiki page\n"
+            "  wiki_search(query)    -- search stored knowledge (FTS5 + recency boost)\n"
+            "  wiki_read(name)       -- read a wiki page\n"
             "  wiki_write(name, content, message) -- save durable knowledge\n"
-            "  wiki_ls(sort)      -- list all pages\n"
-            "  wiki_stats()       -- storage statistics\n\n"
-            "Save important facts to the wiki: user preferences, environment quirks,\n"
-            "project conventions, workflows, and non-trivial solutions.\n"
+            "  wiki_capture(content, tags) -- quick fact capture (no full page needed)\n"
+            "  wiki_graph(name)      -- show page connections in the link graph\n"
+            "  wiki_tags(tag)        -- browse pages by tags\n"
+            "  wiki_ls(sort)         -- list all pages\n"
+            "  wiki_stats()          -- storage statistics\n"
+            "  wiki_health()         -- health report (orphans, broken links, tiers)\n\n"
             "The wiki persists across all sessions, is FTS5-searchable, and auto-syncs\n"
             "from the built-in memory tool. Built-in stays for compact surface facts;\n"
-            "depth and detail go in the wiki."
+            "depth and detail go in the wiki.\n"
+            "Use [[wiki-links]] in page content to connect pages -- they're auto-tracked."
         )
 
-    # -- Prefetch (recall before each turn) ------------------------------
+    # -- Prefetch (recall before each turn) ----------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Search wiki for pages relevant to the current turn's query.
@@ -254,7 +339,6 @@ class MemoryWikiProvider(MemoryProvider):
             return ""
 
         try:
-            # Extract potential tag terms from query for tag_boost
             words = query.lower().split()
             tag_terms = [w for w in words if len(w) > 3][:5]
 
@@ -268,7 +352,7 @@ class MemoryWikiProvider(MemoryProvider):
             logger.debug("Memory-wiki prefetch: %s", e)
             return ""
 
-    # -- Turn sync -------------------------------------------------------
+    # -- Turn sync (autopilot) -----------------------------------------
 
     def sync_turn(
         self,
@@ -278,20 +362,171 @@ class MemoryWikiProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        if not self._initialized:
+        """v3: Autopilot -- analyze turn for signals and auto-capture high-scoring content."""
+        if not self._initialized or not self._store:
             return
         self._turn_count += 1
 
-    # -- on_pre_compress: save insights before compression ---------------
+        # Only run autopilot if auto_capture is enabled
+        if not self._auto_capture:
+            return
+
+        try:
+            # Scan user message for signal patterns
+            signals = self._detect_signals(user_content)
+            total_score = sum(s["score"] for s in signals)
+            notable_lines = []
+
+            if signals:
+                for sig in signals:
+                    self._store.log_signal(
+                        signal_type=sig["type"],
+                        score=sig["score"],
+                        content=sig["text"],
+                        session_id=self._session_id,
+                    )
+                    notable_lines.append(
+                        f"[{sig['type']}] ({sig['score']}) {sig['text']}"
+                    )
+
+            # Also scan assistant response for things worth remembering
+            if assistant_content:
+                # Long, technically detailed responses may contain important info
+                code_blocks = re.findall(
+                    r"```[\w]*\n(.*?)```", assistant_content, re.DOTALL
+                )
+                if code_blocks:
+                    code_score = min(len(code_blocks), 10) * SIGNAL_CODE
+                    total_score += code_score
+
+                # Extract "Key takeaway" / "Note:" / "Remember:" patterns
+                for line in assistant_content.split("\n"):
+                    ll = line.lower().strip()
+                    if any(
+                        word in ll
+                        for word in [
+                            "remember:",
+                            "note:",
+                            "important:",
+                            "key insight",
+                            "key takeaway",
+                            "lesson learned",
+                            "fixed by",
+                            "root cause",
+                            "🔑",
+                        ]
+                    ):
+                        total_score += SIGNAL_PREFERENCE
+                        notable_lines.append(f"[assistant-note] {line.strip()[:150]}")
+
+            # Auto-capture if score exceeds threshold
+            if total_score >= AUTOPILOT_CAPTURE_THRESHOLD and notable_lines:
+                capture_text = (
+                    f"**Session:** {self._session_id[:16]}\n"
+                    f"**Turn:** {self._turn_count}\n"
+                    + "\n".join(notable_lines[:8])
+                )
+                self._store.add_capture(
+                    content=capture_text,
+                    tags="autopilot signal",
+                    source="autopilot",
+                )
+                logger.debug(
+                    "Autopilot: auto-captured turn %d (score=%.1f)",
+                    self._turn_count,
+                    total_score,
+                )
+
+        except Exception as e:
+            logger.debug("Memory-wiki autopilot error: %s", e)
+
+    def _detect_signals(self, text: str) -> list[dict]:
+        """Detect knowledge signals in user message."""
+        signals = []
+        lower = text.lower()
+
+        # Correction signals
+        if any(word in lower for word in ["не так", "wrong", "incorrect", "no,", "нет,", "actually"]):
+            # Find the actual correction content
+            lines = text.split("\n")
+            for line in lines:
+                ll = line.lower().strip()
+                if any(word in ll for word in ["не так", "wrong", "incorrect", "no,", "нет,"]):
+                    signals.append({
+                        "type": "correction",
+                        "score": SIGNAL_CORRECTION,
+                        "text": line.strip()[:200],
+                    })
+                    break
+
+        # Preference / decision signals
+        pref_hints = [
+            "я хочу", "хотел", "предпочитаю", "лучше", "давай",
+            "i want", "i prefer", "let's", "i'd like",
+            "не надо", "не нужно", "don't", "stop",
+            "запомни", "remember", "всегда", "always",
+            "никогда", "never",
+        ]
+        for line in text.split("\n"):
+            ll = line.lower().strip()
+            if any(hint in ll for hint in pref_hints) and len(line) > 15:
+                signals.append({
+                    "type": "preference",
+                    "score": SIGNAL_PREFERENCE,
+                    "text": line.strip()[:200],
+                })
+                break
+
+        # Decision signals ("давай попробуем", "выбираю", "начнём с")
+        decision_hints = [
+            "давай попробуем", "выбираю", "начнём с", "начинаем с",
+            "делаем", "будем использовать", "используем",
+            "let's try", "let's use", "let's start", "we'll use",
+            "go with", "choose",
+        ]
+        for hint in decision_hints:
+            if hint in lower:
+                # Find the full line containing this decision
+                for line in text.split("\n"):
+                    if hint in line.lower():
+                        signals.append({
+                            "type": "decision",
+                            "score": SIGNAL_DECISION,
+                            "text": line.strip()[:200],
+                        })
+                        break
+                break
+
+        # URL signals (important resources)
+        urls = re.findall(r"https?://[^\s)]+", text)
+        for url in urls[:3]:
+            signals.append({
+                "type": "url",
+                "score": SIGNAL_URL,
+                "text": url[:200],
+            })
+
+        # File path signals (configuration items, project files)
+        paths = re.findall(r"[A-Za-z]:\\[^\s)]+|/[A-Za-z0-9_/.-]+", text)
+        for path in paths[:3]:
+            if any(ext in path for ext in [".py", ".yaml", ".json", ".txt", ".md", ".env"]):
+                signals.append({
+                    "type": "config",
+                    "score": SIGNAL_CODE,
+                    "text": path[:200],
+                })
+
+        return signals
+
+    # -- on_pre_compress: enhanced with signal scoring -----------------
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Called before context compression.
 
-        Extracts notable patterns from messages about to be compressed:
-        - Lines with "remember", "note", "important"
-        - User corrections
-        - Code snippets
-        - URLs and file paths
+        v3: Enhanced signal scoring with auto-capture and extraction of:
+        - Corrections, decisions, preferences
+        - Code snippets, file paths, URLs
+        - Notable assistant responses
 
         Saves a compressed snapshot to _compressed/ page.
         Returns empty string (no injection into compression prompt).
@@ -303,6 +538,8 @@ class MemoryWikiProvider(MemoryProvider):
             extracted = []
             user_msgs = []
             last_correction = None
+            accumulated_score = 0.0
+            captured_content = []
 
             for msg in messages:
                 role = msg.get("role", "")
@@ -312,23 +549,52 @@ class MemoryWikiProvider(MemoryProvider):
 
                 if role == "user":
                     user_msgs.append(content)
-                    # Detect corrections
+
+                    # Signal detection (same as autopilot)
+                    signals = self._detect_signals(content)
+                    for sig in signals:
+                        accumulated_score += sig["score"]
+                        captured_content.append(sig["text"])
+
+                    # Detection of corrections
                     if any(word in content.lower() for word in
                            ["не так", "wrong", "incorrect", "no,", "нет,", "actually"]):
-                        last_correction = content[:200]
+                        # Get full correction context
+                        lines = content.split("\n")
+                        correction_lines = [
+                            l.strip() for l in lines
+                            if any(w in l.lower() for w in
+                                   ["не так", "wrong", "incorrect", "no,", "нет,", "correct", "исправ"])
+                        ]
+                        last_correction = "\n".join(correction_lines[:3])[:300]
+
                 elif role == "assistant" and isinstance(content, str):
-                    # Extract notable patterns from assistant responses
                     for line in content.split("\n"):
                         ll = line.lower()
                         if any(word in ll for word in
-                               ["remember:", "note:", "important:", "key insight",
-                                "key takeaway", "lesson learned", "pitfall"]):
+                               ["remember:", "note:", "important:",
+                                "key insight", "key takeaway",
+                                "lesson learned", "pitfall",
+                                "🔑", "✅", "done:", "fixed"]):
                             extracted.append(line.strip()[:200])
 
+            # Auto-capture high-scoring content
+            if accumulated_score >= AUTOPILOT_CAPTURE_THRESHOLD and captured_content:
+                capture_text = (
+                    f"**Source:** pre_compress\n"
+                    f"**Session:** {self._session_id[:16]}\n"
+                    + "\n".join(captured_content[:8])
+                )
+                self._store.add_capture(
+                    content=capture_text,
+                    tags="pre_compress",
+                    source="pre_compress",
+                )
+
+            # Save compressed snapshot
             if not extracted and not last_correction:
                 return ""
 
-            # Save to compressed page
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             session_short = self._session_id[:8] if self._session_id else "unknown"
 
@@ -348,7 +614,7 @@ class MemoryWikiProvider(MemoryProvider):
                 new_content = existing["body"] + "\n" + entry
             else:
                 new_content = (
-                    "# \U0001f4be Compressed Context Snapshots\n\n"
+                    "# 📖 Compressed Context Snapshots\n\n"
                     "_Auto-captured before context compression._\n\n"
                 ) + entry
 
@@ -358,7 +624,7 @@ class MemoryWikiProvider(MemoryProvider):
 
         return ""
 
-    # -- Session end -----------------------------------------------------
+    # -- Session end ---------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if self._session_ended or not self._initialized or not self._store:
@@ -374,6 +640,7 @@ class MemoryWikiProvider(MemoryProvider):
                 except (json.JSONDecodeError, TypeError):
                     entries = []
 
+            # v3: include turn count and autopilot signals
             summary = {
                 "session_id": self._session_id,
                 "turns": self._turn_count,
@@ -384,7 +651,7 @@ class MemoryWikiProvider(MemoryProvider):
             entries = entries[-20:]
 
             content = (
-                "# \U0001f4cb Session History\n\n"
+                "# 📋 Session History\n\n"
                 "Auto-recorded sessions summary.\n\n"
                 f"Total sessions logged: {len(entries)}\n\n"
             )
@@ -401,6 +668,25 @@ class MemoryWikiProvider(MemoryProvider):
                 content,
                 meta={"title": "Session History", "sessions": json.dumps(entries)},
             )
+
+            # v3: auto-capture session summary as a capture
+            if self._auto_capture and self._turn_count > 3:
+                signals = self._store.get_recent_signals(limit=10, min_score=1.0)
+                if signals:
+                    sig_summary = "\n".join(
+                        f"- [{s['signal_type']}] {s['content'][:100]}"
+                        for s in signals[:5]
+                    )
+                    capture_text = (
+                        f"**Session end — {self._turn_count} turns**\n\n"
+                        f"**Signals captured:**\n{sig_summary}"
+                    )
+                    self._store.add_capture(
+                        content=capture_text,
+                        tags="session-end",
+                        source="session_end",
+                    )
+
             self._store._log_entry(
                 action="session_end",
                 target=self._session_id[:16],
@@ -409,7 +695,7 @@ class MemoryWikiProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Memory-wiki on_session_end: %s", e)
 
-    # -- Session switch (v2: handle /resume, /branch) --------------------
+    # -- Session switch -------------------------------------------------
 
     def on_session_switch(
         self,
@@ -419,20 +705,12 @@ class MemoryWikiProvider(MemoryProvider):
         reset: bool = False,
         **kwargs,
     ) -> None:
-        """Handle session_id rotation (e.g. /resume, /branch, /new).
-
-        v2: properly updates internal session tracking and flushes
-        per-session buffers on reset.
-        """
         if not new_session_id:
             return
-
-        # Flush accumulated state if this is a genuinely new conversation
         if reset:
             self._turn_count = 0
             self._session_ended = False
 
-        # Update the tracked session id
         old_id = self._session_id
         self._session_id = new_session_id
 
@@ -443,7 +721,7 @@ class MemoryWikiProvider(MemoryProvider):
             reset,
         )
 
-    # -- Delegation (v2: capture subagent results) -----------------------
+    # -- Delegation ----------------------------------------------------
 
     def on_delegation(
         self,
@@ -453,10 +731,6 @@ class MemoryWikiProvider(MemoryProvider):
         child_session_id: str = "",
         **kwargs,
     ) -> None:
-        """Called when a subagent completes.
-
-        Saves the task+result pair to the wiki for future reference.
-        """
         if not self._initialized or not self._store:
             return
         if not task or not result:
@@ -475,7 +749,7 @@ class MemoryWikiProvider(MemoryProvider):
                 body = existing["body"] + f"\n---\n\n### {ts} (child: {child_id})\n\n**Task:** {task_short}\n\n{result}\n"
             else:
                 body = (
-                    "# \U0001f916 Subagent Delegations\n\n"
+                    "# 🤖 Subagent Delegations\n\n"
                     "_Auto-captured task+result pairs._\n\n"
                     f"### {ts} (child: {child_id})\n\n"
                     f"**Task:** {task_short}\n\n{result}\n"
@@ -490,7 +764,7 @@ class MemoryWikiProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Memory-wiki on_delegation: %s", e)
 
-    # -- Memory write mirror ---------------------------------------------
+    # -- Memory write mirror -------------------------------------------
 
     def on_memory_write(
         self,
@@ -499,10 +773,6 @@ class MemoryWikiProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Mirror built-in memory tool writes to wiki pages.
-
-        v2: replace uses proper old_text matching from metadata.
-        """
         if not self._initialized or not self._store or action == "remove":
             return
 
@@ -523,17 +793,13 @@ class MemoryWikiProvider(MemoryProvider):
                 body += entry
 
         elif action == "replace":
-            # v2: use metadata.old_text for precise matching
             old_text = ""
             if metadata and isinstance(metadata, dict):
                 old_text = metadata.get("old_text", "")
 
             if old_text and old_text in body:
-                # Replace the old_text line specifically
                 body = body.replace(f"- {old_text}", f"- {content}", 1)
             else:
-                # Fallback: find any entry containing old_text substring
-                # Look for list items containing the old_text
                 lines = body.split("\n")
                 new_lines = []
                 replaced = False
@@ -547,7 +813,6 @@ class MemoryWikiProvider(MemoryProvider):
                 if replaced:
                     body = "\n".join(new_lines)
                 else:
-                    # If nothing matched, just append
                     entry = f"- {content}\n"
                     if entry not in body:
                         body += entry
@@ -559,15 +824,19 @@ class MemoryWikiProvider(MemoryProvider):
             commit_message=f"{action} builtin-{target}: {content[:60]}",
         )
 
-    # -- Tools -----------------------------------------------------------
+    # -- Tools ----------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             WIKI_SEARCH_SCHEMA,
             WIKI_READ_SCHEMA,
             WIKI_WRITE_SCHEMA,
+            WIKI_CAPTURE_SCHEMA,
+            WIKI_GRAPH_SCHEMA,
+            WIKI_TAGS_SCHEMA,
             WIKI_LS_SCHEMA,
             WIKI_STATS_SCHEMA,
+            WIKI_HEALTH_SCHEMA,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -582,8 +851,12 @@ class MemoryWikiProvider(MemoryProvider):
                 "wiki_search": self._handle_search,
                 "wiki_read": self._handle_read,
                 "wiki_write": self._handle_write,
+                "wiki_capture": self._handle_capture,
+                "wiki_graph": self._handle_graph,
+                "wiki_tags": self._handle_tags,
                 "wiki_ls": self._handle_ls,
                 "wiki_stats": self._handle_stats,
+                "wiki_health": self._handle_health,
             }
             handler = handlers.get(tool_name)
             if handler:
@@ -650,6 +923,96 @@ class MemoryWikiProvider(MemoryProvider):
             "result": result,
         }, ensure_ascii=False)
 
+    def _handle_capture(self, args: dict) -> str:
+        content = args.get("content", "")
+        tags = args.get("tags", "")
+        if not content:
+            return json.dumps({"success": False, "error": "content is required."}, ensure_ascii=False)
+
+        result = self._store.add_capture(content=content, tags=tags, source="user")
+        if "error" in result:
+            return json.dumps({"success": False, "error": result["error"]}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "result": {
+                "id": result["id"],
+                "path": result["path"],
+                "tags": result["tags"],
+                "created_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "message": f"Saved capture. Tags: {', '.join(result['tags']) or '(none)'}. "
+                       f"Use wiki_capture to add more, or use wiki_write when it needs a full page.",
+        }, ensure_ascii=False)
+
+    def _handle_graph(self, args: dict) -> str:
+        name = args.get("name", "")
+        if not name:
+            return json.dumps({"success": False, "error": "Page name is required."}, ensure_ascii=False)
+
+        graph = self._store.get_graph(name)
+
+        # Check if page exists
+        exists = self._store.page_exists(name)
+
+        result = {
+            "page": name,
+            "page_exists": exists,
+            "outgoing": graph["outgoing"],
+            "incoming": graph["incoming"],
+            "outgoing_count": graph["outgoing_count"],
+            "incoming_count": graph["incoming_count"],
+        }
+
+        if not exists and graph["outgoing_count"] == 0 and graph["incoming_count"] == 0:
+            result["message"] = f"Page '{name}' not found and no links reference it."
+            return json.dumps({"success": True, "result": result}, ensure_ascii=False)
+
+        msg_parts = []
+        if graph["outgoing_count"] > 0:
+            msg_parts.append(f"links to {graph['outgoing_count']} page(s)")
+        if graph["incoming_count"] > 0:
+            msg_parts.append(f"linked from {graph['incoming_count']} page(s)")
+
+        if msg_parts:
+            result["message"] = f"**{name}** " + ", ".join(msg_parts) + "."
+        else:
+            result["message"] = f"**{name}** has no wiki-links to or from other pages (orphan)."
+
+        return json.dumps({"success": True, "result": result}, ensure_ascii=False)
+
+    def _handle_tags(self, args: dict) -> str:
+        tag_filter = args.get("tag", "").strip().lower()
+
+        pages = self._store.list_pages()
+
+        # Collect all tags and their pages
+        tag_map: dict[str, list[dict]] = {}
+        for p in pages:
+            for t in p.get("tags", []):
+                tl = t.lower()
+                if tag_filter and tag_filter not in tl:
+                    continue
+                if tl not in tag_map:
+                    tag_map[tl] = []
+                tag_map[tl].append({
+                    "name": p["name"],
+                    "title": p["title"],
+                })
+
+        # Sort tags by page count
+        sorted_tags = sorted(tag_map.items(), key=lambda x: -len(x[1]))
+
+        result = {
+            "tag_filter": tag_filter or None,
+            "tags": [
+                {"tag": tag, "page_count": len(pages), "pages": pages}
+                for tag, pages in sorted_tags
+            ],
+            "total_tags": len(sorted_tags),
+        }
+
+        return json.dumps({"success": True, "result": result}, ensure_ascii=False)
+
     def _handle_ls(self, args: dict) -> str:
         sort = args.get("sort", "alpha")
         pages = self._store.list_pages(sort=sort)
@@ -665,14 +1028,21 @@ class MemoryWikiProvider(MemoryProvider):
             "total": len(pages),
         }, ensure_ascii=False)
 
-    def _handle_stats(self) -> str:
+    def _handle_stats(self, args: dict = None) -> str:
         stats = self._store.get_stats()
         return json.dumps({
             "success": True,
             "stats": stats,
         }, ensure_ascii=False)
 
-    # -- Config ----------------------------------------------------------
+    def _handle_health(self, args: dict = None) -> str:
+        health = self._store.get_health()
+        return json.dumps({
+            "success": True,
+            "health": health,
+        }, ensure_ascii=False)
+
+    # -- Config ---------------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -694,7 +1064,7 @@ class MemoryWikiProvider(MemoryProvider):
             },
             {
                 "key": "auto_capture",
-                "description": "Auto-sync built-in memory tool writes to wiki (true/false, default: true).",
+                "description": "Auto-sync built-in memory tool writes to wiki + autopilot capture (true/false, default: true).",
                 "default": "true",
                 "choices": ["true", "false"],
             },
@@ -724,7 +1094,7 @@ class MemoryWikiProvider(MemoryProvider):
         elif config_path.exists():
             config_path.unlink()
 
-    # -- Shutdown --------------------------------------------------------
+    # -- Shutdown -------------------------------------------------------
 
     def shutdown(self) -> None:
         if self._store:
