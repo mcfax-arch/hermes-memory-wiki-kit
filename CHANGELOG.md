@@ -28,7 +28,7 @@
 
 - `tools/wiki-capture.py` — CLI quick capture tool
 - `tools/wiki-maintenance.py` — full maintenance: `--decay`, `--promote`, `--health`, `--graph`
-- Old `tools/memory-*.py` scripts are superseded but kept for backward compatibility
+- Old `tools/memory-*.py` scripts replaced with `wiki-*.py` — clean break
 
 ### Store improvements
 
