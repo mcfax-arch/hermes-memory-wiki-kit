@@ -76,6 +76,7 @@ class WikiStore:
                 path TEXT PRIMARY KEY,
                 title TEXT,
                 modified REAL,
+                tier TEXT DEFAULT 'active',
                 content TEXT
             )"""
         )
@@ -89,6 +90,11 @@ class WikiStore:
                 value TEXT
             )"""
         )
+        # Migrate: add tier column if upgrading from older version
+        try:
+            self._db.execute("ALTER TABLE pages ADD COLUMN tier TEXT DEFAULT 'active'")
+        except sqlite3.OperationalError:
+            pass  # already exists
         self._db.commit()
 
     def close(self):
@@ -326,9 +332,21 @@ class WikiStore:
             return
         try:
             now = time.time()
+            # Extract tier from frontmatter
+            tier = "active"
+            try:
+                m = _FRONTMATTER_RE.match(content)
+                if m:
+                    import yaml
+                    meta = yaml.safe_load(m.group(1)) or {}
+                    tier = meta.get("tier", "active")
+                    if tier not in ("active", "warm", "stale"):
+                        tier = "active"
+            except Exception:
+                pass
             self._db.execute(
-                "INSERT OR REPLACE INTO pages (path, title, modified, content) VALUES (?, ?, ?, ?)",
-                (name, title, now, content),
+                "INSERT OR REPLACE INTO pages (path, title, modified, tier, content) VALUES (?, ?, ?, ?, ?)",
+                (name, title, now, tier, content),
             )
             self._db.execute(
                 "INSERT OR REPLACE INTO pages_fts (path, title, content) VALUES (?, ?, ?)",
@@ -374,7 +392,8 @@ class WikiStore:
             sql = """SELECT p.path, p.title,
                             snippet(pages_fts, 1, '<b>', '</b>', '...', 32) as snip,
                             bm25(pages_fts, 0, 1.0, 5.0, 5.0) as score,
-                            p.modified
+                            p.modified,
+                            p.tier
                      FROM pages_fts
                      JOIN pages p ON pages_fts.path = p.path
                      WHERE pages_fts MATCH ?
@@ -388,9 +407,9 @@ class WikiStore:
                 title = row[1]
                 bm25_score = row[3]
                 modified = row[4]
+                tier = row[5] or "active"
 
-                # Recency boost: pages modified in last 7 days get a discount on the BM25 score
-                # (lower BM25 = better match, so we subtract a recency bonus)
+                # Recency boost: pages modified in last 7 days get priority
                 age_days = (now - modified) / 86400
                 recency_boost = 0.0
                 if age_days < 1:
@@ -409,7 +428,11 @@ class WikiStore:
                             tag_score = -1.0
                             break
 
-                final_score = bm25_score + recency_boost + tag_score
+                # Tier penalty: stale pages sink to bottom
+                tier_map = {"stale": 5.0, "warm": 1.0, "active": 0.0}
+                tier_penalty = tier_map.get(tier, 0.0)
+
+                final_score = bm25_score + recency_boost + tag_score + tier_penalty
 
                 results.append({
                     "name": name,
@@ -418,6 +441,7 @@ class WikiStore:
                     "score": round(final_score, 4),
                     "bm25": round(bm25_score, 4),
                     "modified": modified,
+                    "tier": tier,
                 })
 
             # Re-sort by composite score, then limit
