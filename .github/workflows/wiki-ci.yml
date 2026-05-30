@@ -1,0 +1,140 @@
+name: Wiki Maintenance CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/**'
+      - 'tools/**'
+      - '.github/workflows/wiki-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'plugins/**'
+      - 'tools/**'
+  schedule:
+    # Daily health check at 06:00 UTC
+    - cron: '0 6 * * *'
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile plugins/memory_wiki/store.py
+          python -m py_compile plugins/memory_wiki/__init__.py
+          python -m py_compile tools/wiki-capture.py
+          python -m py_compile tools/wiki-maintenance.py
+          echo "✅ All files compile"
+
+      - name: Test WikiStore import
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'plugins')
+          from memory_wiki.store import WikiStore
+          print('✅ WikiStore imported successfully')
+          "
+
+      - name: Create test wiki and run health
+        run: |
+          python -c "
+          import sys, tempfile, os
+          sys.path.insert(0, 'plugins')
+          from memory_wiki.store import WikiStore
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = os.path.join(tmp, 'test-wiki')
+              store = WikiStore(root)
+
+              # Create a test page
+              store.write_page('test-page', '# Test\n\nContent with [[wiki-link]].', commit_message='test')
+              print('✅ Page created')
+
+              # Add a capture
+              result = store.add_capture('Test capture', tags='test capture')
+              print(f'✅ Capture saved: {result[\"id\"]}')
+
+              # Run health check
+              health = store.get_health()
+              print(f'✅ Health: {health[\"health_score\"]}%')
+              print(f'   Pages: {health[\"page_count\"]}')
+              print(f'   Captures: {health[\"unpromoted_captures\"]}')
+              print(f'   Links: {health.get(\"total_links\", 0)}')
+              print(f'   Orphans: {len(health.get(\"orphans\", []))}')
+
+              # Check link graph
+              graph = store.get_graph('test-page')
+              print(f'✅ Graph: {graph[\"outgoing_count\"]} outgoing, {graph[\"incoming_count\"]} incoming')
+
+              # List captures
+              caps = store.list_captures()
+              print(f'✅ Captures listed: {len(caps)}')
+
+              # Test search
+              results = store.search('test')
+              print(f'✅ Search found: {len(results)} results')
+
+              print()
+              print('🎉 All tests passed!')
+          "
+
+  maintenance:
+    runs-on: ubuntu-latest
+    # Only run on schedule or manual dispatch
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Run full maintenance on test wiki
+        run: |
+          python -c "
+          import sys, tempfile, os
+          sys.path.insert(0, 'plugins')
+          from memory_wiki.store import WikiStore
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = os.path.join(tmp, 'test-wiki')
+              store = WikiStore(root)
+
+              # Create some pages with links
+              store.write_page('concept-a', '# Concept A\n\nSee [[concept-b]] and [[concept-c]].')
+              store.write_page('concept-b', '# Concept B\n\nSee [[concept-a]].')
+              store.write_page('concept-c', '# Concept C\n\nNo links to others.')
+
+              # Add captures with shared tags
+              store.add_capture('API rate limit is 40 RPM', tags='api rate-limit')
+              store.add_capture('Token limit is 128K', tags='api token-limit')
+              store.add_capture('Retry with exponential backoff', tags='api rate-limit')
+
+              # Run health
+              health = store.get_health()
+              print(f'Health: {health[\"health_score\"]}%')
+              print(f'Orphans: {[o[\"name\"] for o in health[\"orphans\"]]}')
+              print(f'Links: {health.get(\"total_links\", 0)}')
+              print(f'Unpromoted captures: {health[\"unpromoted_captures\"]}')
+          "
