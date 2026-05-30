@@ -120,6 +120,49 @@ python tools/wiki-maintenance.py --decay
 
 Suitable for cron / Task Scheduler daily maintenance.
 
+## Automated Maintenance
+
+Daily `wiki-maintenance.py` keeps the wiki healthy: stale pages get `tier: stale`, shared-tag captures merge into wiki pages.
+
+### Linux/macOS — cron
+
+```bash
+cd tools/
+chmod +x setup-maintenance.sh
+
+# Install daily at 9:00
+./setup-maintenance.sh --time 09:00
+
+# Check status
+./setup-maintenance.sh --status
+
+# Remove
+./setup-maintenance.sh --uninstall
+```
+
+### Windows — Task Scheduler
+
+```powershell
+cd tools\
+.\Install-Maintenance.ps1
+
+# Custom time
+.\Install-Maintenance.ps1 -Time "06:00"
+
+# Check/remove
+.\Install-Maintenance.ps1 -Status
+.\Install-Maintenance.ps1 -Uninstall
+```
+
+### What maintenance does
+
+```bash
+python tools/wiki-maintenance.py
+#   1. Decay — pages older 30d → warm, 90d → stale
+#   2. Promote — shared-tag captures → wiki pages
+#   3. Health — orphans, broken links, backlog, score
+```
+
 ## Plugin Structure
 
 ```

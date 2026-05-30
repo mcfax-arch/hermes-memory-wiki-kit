@@ -266,6 +266,67 @@ python tools/wiki-maintenance.py --decay
 
 Можно поставить в cron / Task Scheduler для ежедневного обслуживания.
 
+## Автоматическое обслуживание
+
+Ежедневный прогон `wiki-maintenance.py` поддерживает wiki в порядке: протухшие страницы получают tier "stale", captures с общими тегами сливаются в wiki-страницы.
+
+### Вариант A: Hermes cron (рекомендуется)
+
+Если используешь Hermes Agent — встроенный cron сам запускает скрипт:
+
+```bash
+# Уже настроено, если следовал инструкции выше.
+# Проверить:
+hermes cron list
+```
+
+### Вариант B: Linux/macOS — cron
+
+```bash
+cd tools/
+chmod +x setup-maintenance.sh
+
+# Установить ежедневно в 9:00
+./setup-maintenance.sh --time 09:00
+
+# Проверить статус
+./setup-maintenance.sh --status
+
+# Удалить
+./setup-maintenance.sh --uninstall
+```
+
+Лог пишется в `~/.wiki-maintenance.log`.
+
+### Вариант C: Windows — Task Scheduler
+
+```powershell
+# PowerShell (можно от обычного пользователя)
+cd tools\
+.\Install-Maintenance.ps1
+
+# С другим временем
+.\Install-Maintenance.ps1 -Time "06:00"
+
+# Проверить
+.\Install-Maintenance.ps1 -Status
+
+# Удалить
+.\Install-Maintenance.ps1 -Uninstall
+```
+
+### Что делает ежедневное обслуживание
+
+```bash
+# Эквивалентно ручному запуску:
+python tools/wiki-maintenance.py
+
+# А именно:
+#   1. Decay — страницы старше 30d → tier: warm, старше 90d → tier: stale
+#   2. Promote — captures с 2+ общими тегами → wiki-страницы
+#   3. Health — orphans, broken links, backlog, score
+```
+
 ## Структура плагина
 
 ```

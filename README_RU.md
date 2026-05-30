@@ -67,6 +67,36 @@ python tools/wiki-maintenance.py --health
 python tools/wiki-maintenance.py --graph
 ```
 
+## Автоматическое обслуживание
+
+Ежедневный прогон `wiki-maintenance.py` — протухшие страницы получают tier "stale", captures с общими тегами сливаются в wiki-страницы.
+
+### Linux/macOS — cron
+
+```bash
+cd tools/
+chmod +x setup-maintenance.sh
+./setup-maintenance.sh --time 09:00  # установить
+./setup-maintenance.sh --status       # проверить
+```
+
+### Windows — Task Scheduler
+
+```powershell
+cd tools\
+.\Install-Maintenance.ps1             # установить
+.\Install-Maintenance.ps1 -Status     # проверить
+```
+
+### Что делает
+
+```bash
+python tools/wiki-maintenance.py
+# 1. Decay — страницы 30d+ → warm, 90d+ → stale
+# 2. Promote — captures с общими тегами → wiki
+# 3. Health — orphans, broken links, backlog
+```
+
 ## Структура на диске
 
 ```
